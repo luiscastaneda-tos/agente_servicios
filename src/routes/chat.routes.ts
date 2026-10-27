@@ -48,9 +48,16 @@ chatRouter.post(
   (req, res, next) => chatController.ingestDocument(req, res, next)
 );
 
-// Chat multi-agente (acepta JSON o multipart/form-data con archivo opcional)
-chatRouter.post("/chat", upload.single("file"), (req, res, next) =>
-  chatController.sendMessage(req, res, next)
+// Chat multi-agente (acepta JSON o multipart/form-data):
+//  - `file`: un PDF/CSV para ingesta RAG (flujo original)
+//  - `files`: hasta 3 adjuntos (PDF, CSV, Excel, imagen) para el modo cotización
+chatRouter.post(
+  "/chat",
+  upload.fields([
+    { name: "file", maxCount: 1 },
+    { name: "files", maxCount: 3 },
+  ]),
+  (req, res, next) => chatController.sendMessage(req, res, next)
 );
 
 // Obtener estado completo de una sesión (travelState, archivos, cuota y mensajes)

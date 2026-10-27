@@ -22,13 +22,26 @@ export class AppError extends Error {
 }
 
 export function createProvidersUnavailableError(details?: unknown): AppError {
+  // El texto crudo de los proveedores (primaryError / fallbackError) solo va al log del
+  // servidor; al cliente solo le llegan los nombres de los proveedores.
+  console.error("[AI_PROVIDERS_UNAVAILABLE]", details);
+  const info = (details ?? {}) as Record<string, unknown>;
+  const safeDetails =
+    typeof info.primaryProvider === "string" ||
+    typeof info.fallbackProvider === "string"
+      ? {
+          primaryProvider: info.primaryProvider,
+          fallbackProvider: info.fallbackProvider,
+        }
+      : undefined;
+
   return new AppError({
     statusCode: 503,
     code: "AI_PROVIDERS_UNAVAILABLE",
     message:
       "Temporalmente nuestros proveedores de inteligencia artificial (Gemini y OpenAI) no están disponibles o excedieron el tiempo de espera. Por favor intenta enviar tu solicitud nuevamente en unos momentos.",
     retryable: true,
-    details,
+    details: safeDetails,
   });
 }
 

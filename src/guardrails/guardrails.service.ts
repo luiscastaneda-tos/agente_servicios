@@ -1,10 +1,12 @@
 import { z } from "zod";
 import { env } from "../config/env";
+import { inspectZip } from "../utils/zip-guard";
 import {
   SessionState,
   TravelState,
   TransportOptionItem,
   UIPayload,
+  QuoteDraft,
 } from "../types";
 import {
   AppError,
@@ -30,6 +32,7 @@ export const TransportOptionSchema: z.ZodType<
   arrivalPoint: z.string().optional(),
   estimatedDuration: z.string().optional(),
   frequencyOrSchedule: z.string().optional(),
+  departureTimes: z.array(z.string()).optional(),
   serviceClass: z.string().optional(),
   vehicleCategory: z.string().optional(),
   highlights: z.array(z.string()).default([]),
@@ -45,6 +48,7 @@ export const UIPayloadSchema: z.ZodType<UIPayload, z.ZodTypeDef, unknown> =
       "table",
       "summary_cards",
       "extracted_fields",
+      "quote_draft",
     ])
     .default("none"),
   title: z.string().optional(),
@@ -77,6 +81,8 @@ export const UIPayloadSchema: z.ZodType<UIPayload, z.ZodTypeDef, unknown> =
       })
     )
     .optional(),
+  // El borrador de cotización ya viene validado por el QuoteAgent.
+  quoteDraft: z.custom<QuoteDraft>().optional(),
 });
 
 export const TravelStateSchema: z.ZodType<Partial<TravelState>> = z.object({
@@ -224,6 +230,96 @@ export class GuardrailsService {
       400,
       "UNSUPPORTED_FILE_TYPE"
     );
+  }
+
+  /**
+   * Valida un adjunto del modo cotización (PDF, CSV, Excel .xlsx o imagen).
+   * Además de extensión/MIME comprueba la firma real del archivo.
+   */
+  public validateQuoteFile(file: Express.Multer.File): {
+    kind: "pdf" | "csv" | "excel" | "image";
+    mimeType: string;
+  } {
+    const maxBytes = env.maxFileSizeMb * 1024 * 1024;
+    if (file.size > maxBytes) {
+      throw new GuardrailError(
+        `El archivo "${file.originalname}" excede el límite máximo de ${env.maxFileSizeMb} MB.`,
+        413,
+        "FILE_TOO_LARGE"
+      );
+    }
+    if (file.size === 0 || !file.buffer || file.buffer.length === 0) {
+      throw new GuardrailError(
+        `El archivo "${file.originalname}" está vacío.`,
+        400,
+        "EMPTY_FILE"
+      );
+    }
+
+    const name = file.originalname.toLowerCase();
+    const head = file.buffer.subarray(0, 12);
+    const startsWith = (...bytes: number[]) =>
+      bytes.every((b, i) => head[i] === b);
+
+    const unsupported = () =>
+      new GuardrailError(
+        `Formato no soportado ("${file.originalname}"). En cotizaciones acepto PDF, CSV, Excel (.xlsx) e imágenes (PNG, JPG, WEBP).`,
+        400,
+        "UNSUPPORTED_FILE_TYPE"
+      );
+
+    if (name.endsWith(".pdf")) {
+      if (!startsWith(0x25, 0x50, 0x44, 0x46)) throw unsupported();
+      return { kind: "pdf", mimeType: "application/pdf" };
+    }
+    if (name.endsWith(".xlsx")) {
+      if (!startsWith(0x50, 0x4b)) throw unsupported();
+      // Un .xlsx es un ZIP: se descarta si al descomprimirse es desproporcionado (zip bomb).
+      const zip = inspectZip(file.buffer);
+      if (!zip.ok) {
+        throw new GuardrailError(
+          `No puedo leer "${file.originalname}": ${zip.reason}. Revisa el archivo o guárdalo de nuevo como .xlsx.`,
+          400,
+          "FILE_TOO_COMPLEX"
+        );
+      }
+      return {
+        kind: "excel",
+        mimeType:
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      };
+    }
+    if (name.endsWith(".xls")) {
+      throw new GuardrailError(
+        `"${file.originalname}" es un Excel antiguo (.xls). Guárdalo como .xlsx y vuelve a subirlo.`,
+        400,
+        "UNSUPPORTED_FILE_TYPE"
+      );
+    }
+    if (name.endsWith(".csv")) {
+      if (head.includes(0x00)) throw unsupported();
+      return { kind: "csv", mimeType: "text/csv" };
+    }
+    if (name.endsWith(".png")) {
+      if (!startsWith(0x89, 0x50, 0x4e, 0x47)) throw unsupported();
+      return { kind: "image", mimeType: "image/png" };
+    }
+    if (name.endsWith(".jpg") || name.endsWith(".jpeg")) {
+      if (!startsWith(0xff, 0xd8, 0xff)) throw unsupported();
+      return { kind: "image", mimeType: "image/jpeg" };
+    }
+    if (name.endsWith(".webp")) {
+      const isWebp =
+        startsWith(0x52, 0x49, 0x46, 0x46) &&
+        head[8] === 0x57 &&
+        head[9] === 0x45 &&
+        head[10] === 0x42 &&
+        head[11] === 0x50;
+      if (!isWebp) throw unsupported();
+      return { kind: "image", mimeType: "image/webp" };
+    }
+
+    throw unsupported();
   }
 
   public validateSessionQuota(

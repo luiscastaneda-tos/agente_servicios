@@ -1,6 +1,11 @@
 import { NextFunction, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import { AgentRouterOrchestrator } from "../agents/agent-router.orchestrator";
+import { QuoteInputFile } from "../agents/quote/quote-input.reader";
+import {
+  QuoteDraftInput,
+  QuoteDraftInputSchema,
+} from "../agents/quote/quote.schema";
 import { GuardrailsService } from "../guardrails/guardrails.service";
 import { ChatSessionRepository } from "../repositories/chat-session.repository";
 import { SupabaseVectorRepository } from "../repositories/supabase-vector.repository";
@@ -9,6 +14,7 @@ import { WebSearchRepository } from "../repositories/web-search.repository";
 import { llmContext } from "../strategies/llm.context";
 import { AttachedDocumentMeta, LLMProviderType } from "../types";
 import { AppError } from "../utils/errors";
+import { dropNulls } from "../utils/price-filter";
 
 // Shared repository instances so local fallback state (when Supabase env is not yet set)
 // is shared seamlessly between document ingestion and chat orchestration.
@@ -135,12 +141,46 @@ export class ChatController {
     try {
       const sessionId = (req.body?.sessionId as string) || uuidv4();
       const userId = (req.body?.userId as string) || "anonymous";
-      const message = (req.body?.message as string) || "";
+      const rawMessage = (req.body?.message as string) || "";
       const preferredProvider = req.body?.provider as LLMProviderType | undefined;
 
+      // El router de multer (fields) deja los archivos en req.files por nombre de campo:
+      // `file` = ingesta RAG de un PDF/CSV (flujo original), `files` = adjuntos de cotización.
+      const uploaded = (
+        req.files && !Array.isArray(req.files) ? req.files : {}
+      ) as Record<string, Express.Multer.File[]>;
+      const singleFile = uploaded.file?.[0] ?? req.file;
+      const quoteUploads = uploaded.files ?? [];
+      const isQuoteMode = req.body?.mode === "quote" || quoteUploads.length > 0;
+
+      // En modo cotización el archivo suelto también es un adjunto de cotización, no ingesta RAG.
+      const quoteFiles: QuoteInputFile[] = (
+        isQuoteMode
+          ? [...(singleFile ? [singleFile] : []), ...quoteUploads]
+          : []
+      ).map((file) => {
+        const { kind, mimeType } = sharedGuardrails.validateQuoteFile(file);
+        return {
+          // multer decodifica el nombre como latin1; se recupera el UTF-8 original (acentos).
+          fileName: Buffer.from(file.originalname, "latin1").toString("utf8"),
+          mimeType,
+          kind,
+          buffer: file.buffer,
+        };
+      });
+
+      const message =
+        rawMessage.trim() ||
+        (quoteFiles.length > 0
+          ? "Cotiza lo que viene en los archivos adjuntos."
+          : rawMessage);
+      const currentDraft = isQuoteMode
+        ? this.parseCurrentDraft(req.body?.currentDraft)
+        : undefined;
+
       // Si en la misma llamada adjuntaron un archivo PDF o CSV, lo tokenizamos e indexamos primero
-      if (req.file) {
-        sharedGuardrails.validateFileUpload(req.file);
+      if (!isQuoteMode && singleFile) {
+        sharedGuardrails.validateFileUpload(singleFile);
         const session = await sharedSessionRepo.getOrCreateSession(
           sessionId,
           userId
@@ -148,9 +188,9 @@ export class ChatController {
         sharedGuardrails.validateSessionQuota(session, "file");
 
         const tokenized = await sharedTokenizerRepo.tokenizeFile({
-          buffer: req.file.buffer,
-          fileName: req.file.originalname,
-          mimeType: req.file.mimetype,
+          buffer: singleFile.buffer,
+          fileName: singleFile.originalname,
+          mimeType: singleFile.mimetype,
           sessionId,
           userId,
         });
@@ -182,6 +222,7 @@ export class ChatController {
         userId,
         message,
         preferredProvider,
+        ...(isQuoteMode ? { mode: "quote" as const, currentDraft, quoteFiles } : {}),
       });
 
       res.status(200).json({
@@ -191,6 +232,22 @@ export class ChatController {
     } catch (err) {
       next(err);
     }
+  }
+
+  // currentDraft llega como JSON string en multipart o como objeto en JSON; si no es válido se ignora.
+  private parseCurrentDraft(raw: unknown): QuoteDraftInput | undefined {
+    let value: unknown = raw;
+    if (typeof raw === "string") {
+      if (!raw.trim()) return undefined;
+      try {
+        value = JSON.parse(raw);
+      } catch {
+        return undefined;
+      }
+    }
+    if (!value || typeof value !== "object") return undefined;
+    const parsed = QuoteDraftInputSchema.safeParse(dropNulls(value));
+    return parsed.success ? parsed.data : undefined;
   }
 
   /**

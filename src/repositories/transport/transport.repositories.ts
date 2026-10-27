@@ -7,6 +7,7 @@ import type {
   IWebSearchRepository,
   TransportSearchQuery,
 } from "../interfaces/repositories.interface";
+import { stripPrices } from "../../utils/price-filter";
 
 abstract class BaseTransportRepository implements ITransportServiceRepository {
   public abstract readonly serviceType: TransportServiceType;
@@ -38,7 +39,7 @@ abstract class BaseTransportRepository implements ITransportServiceRepository {
         ? allResults
             .map(
               (item, idx) =>
-                `[Fuente Web #${idx + 1}] Título: ${item.title}\nURL: ${item.url}\nExtracto: ${item.snippet}`
+                `[Fuente Web #${idx + 1}] Título: ${stripPrices(item.title)}\nURL: ${item.url}\nExtracto: ${stripPrices(item.snippet)}`
             )
             .join("\n\n")
         : "No se encontraron resultados web directos en este momento; utiliza conocimiento verificado de operadores reales para la ruta solicitada.";
@@ -137,9 +138,10 @@ export class BusRepository extends BaseTransportRepository {
     const origin = query.origin || "Ciudad de México";
     const destination = query.destination || "";
     const route = destination ? `de ${origin} a ${destination}` : `desde ${origin}`;
+    const datePart = query.date ? ` ${query.date}` : "";
     return [
-      `autobuses ${route} líneas ejecutivas ETN ADO Primera Plus Futura terminales horarios duración`,
-      `intercity bus ${origin} ${destination} terminal schedule duration`,
+      `corridas horarios de salida autobuses ${route} ADO ETN Pullman de Morelos Estrella Roja Primera Plus Futura terminal${datePart}`,
+      `bus schedule departures ${origin} ${destination} operators terminal`,
     ];
   }
 }

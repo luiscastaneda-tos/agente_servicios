@@ -27,7 +27,11 @@ import {
   SessionState,
   TravelState,
 } from "../types";
+import { parseTravelDate } from "../utils/date-parser";
 import { CsvAnalystAgent } from "./documents/csv-analyst.agent";
+import { QuoteAgent } from "./quote/quote.agent";
+import { QuoteInputFile } from "./quote/quote-input.reader";
+import { QuoteDraftInput } from "./quote/quote.schema";
 import { PdfSpecialistAgent } from "./documents/pdf-specialist.agent";
 import {
   BusAgent,
@@ -60,7 +64,14 @@ export interface AgentRouterInput {
   userId?: string;
   message: string;
   preferredProvider?: LLMProviderType;
+  // Modo cotización: el mensaje y los adjuntos se convierten en un borrador de cotización.
+  mode?: "quote";
+  currentDraft?: QuoteDraftInput;
+  quoteFiles?: QuoteInputFile[];
 }
+
+// Intención explícita de cotizar ("cotiza", "cotízame", "cotización"...).
+const QUOTE_INTENT = /\bcotiz(?:a|ar|ame|en|e|aci[oó]n|aciones)\b|\bcot[ií]zame\b/i;
 
 export interface AgentRouterDependencies {
   sessionRepo?: IChatSessionRepository;
@@ -85,6 +96,7 @@ export class AgentRouterOrchestrator {
   private readonly busAgent: BusAgent;
   private readonly pdfAgent: PdfSpecialistAgent;
   private readonly csvAgent: CsvAnalystAgent;
+  private readonly quoteAgent: QuoteAgent;
   private readonly generalAgent: GeneralMiaAgent;
 
   constructor(deps: AgentRouterDependencies = {}) {
@@ -134,6 +146,7 @@ export class AgentRouterOrchestrator {
       this.llm,
       this.guardrails
     );
+    this.quoteAgent = new QuoteAgent(this.llm, this.guardrails);
     this.generalAgent = new GeneralMiaAgent(this.llm, this.guardrails);
   }
 
@@ -162,13 +175,20 @@ export class AgentRouterOrchestrator {
       env.slidingWindowMessages
     );
 
-    // 4. Classify intent into one of the 9 specialties
-    const classification = await this.classifyIntent(
-      sanitizedMessage,
-      session,
-      recentHistory,
-      preferredProvider
-    );
+    // 4. Classify intent into one of the specialties (el modo/intención de cotizar tiene prioridad)
+    const classification: {
+      specialty: AgentSpecialtyType;
+      extractedOrigin?: string;
+      extractedDestination?: string;
+    } =
+      input.mode === "quote" || QUOTE_INTENT.test(sanitizedMessage)
+        ? { specialty: "quote_agent" }
+        : await this.classifyIntent(
+            sanitizedMessage,
+            session,
+            recentHistory,
+            preferredProvider
+          );
 
     // Pre-merge any route hints detected during classification into session.travelState
     const workingSession: SessionState = {
@@ -219,6 +239,13 @@ export class AgentRouterOrchestrator {
       case "csv_analyst":
         result = await this.csvAgent.execute(executionParams);
         break;
+      case "quote_agent":
+        result = await this.quoteAgent.execute({
+          ...executionParams,
+          currentDraft: input.currentDraft,
+          files: input.quoteFiles,
+        });
+        break;
       case "general_assistant":
       default:
         result = await this.generalAgent.execute(executionParams);
@@ -255,10 +282,14 @@ export class AgentRouterOrchestrator {
 
     // 7. Persist both user message and assistant response in ChatSessionRepository
     const nowIso = new Date().toISOString();
+    const attachedNames = (input.quoteFiles ?? []).map((f) => f.fileName);
     const userMessageRecord: ChatMessageRecord = {
       sessionId,
       role: "user",
-      content: sanitizedMessage,
+      content:
+        attachedNames.length > 0
+          ? `${sanitizedMessage}\n📎 ${attachedNames.join(", ")}`
+          : sanitizedMessage,
       createdAt: nowIso,
     };
 
@@ -392,6 +423,19 @@ export class AgentRouterOrchestrator {
       )
     ) {
       return { specialty: "flight" };
+    }
+
+    // 3a. Respuesta corta con solo fecha o pasajeros ("mañana", "el 15 de noviembre",
+    // "somos 3 personas"): continúa con el servicio activo de la sesión.
+    if (
+      session.travelState.activeService &&
+      message.length <= 80 &&
+      (parseTravelDate(message) !== null ||
+        /^\s*(?:somos\s+)?\d+\s*(?:pasajeros?|personas?|adultos?)\s*[.!]?\s*$/i.test(
+          message
+        ))
+    ) {
+      return { specialty: session.travelState.activeService };
     }
 
     // 3. Contextual follow-up (e.g., "¿y de regreso?", "¿y saliendo de Monterrey?") when activeService exists

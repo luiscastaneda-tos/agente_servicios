@@ -12,6 +12,7 @@ export type AgentSpecialtyType =
   | TransportServiceType
   | "pdf_specialist"
   | "csv_analyst"
+  | "quote_agent"
   | "general_assistant";
 
 export interface TravelState {
@@ -56,6 +57,7 @@ export interface TransportOptionItem {
   arrivalPoint?: string;
   estimatedDuration?: string;
   frequencyOrSchedule?: string;
+  departureTimes?: string[];
   serviceClass?: string;
   vehicleCategory?: string;
   highlights: string[];
@@ -67,7 +69,8 @@ export type UIPayloadType =
   | "transport_options"
   | "table"
   | "summary_cards"
-  | "extracted_fields";
+  | "extracted_fields"
+  | "quote_draft";
 
 export interface UIPayload {
   type: UIPayloadType;
@@ -89,6 +92,92 @@ export interface UIPayload {
     value: string | number;
     description?: string;
   }>;
+  quoteDraft?: QuoteDraft;
+}
+
+// --- Cotizaciones (borrador que revisa el usuario antes de enviarlo a Operaciones) ---
+// Fechas ISO YYYY-MM-DD, horas HH:mm. Sin ningún campo de precio: lo cotiza Operaciones.
+export type QuoteServiceType = "flight" | "car_rental" | "hotel" | "bus";
+
+interface QuoteItemBase {
+  id: string;
+  type: QuoteServiceType;
+  travelers?: number;
+  travelerNames?: string[];
+  notes?: string;
+}
+
+export interface FlightQuoteItem extends QuoteItemBase {
+  type: "flight";
+  tripType?: "oneway" | "roundtrip" | "multicity";
+  origin?: string;
+  destination?: string;
+  departureDate?: string;
+  returnDate?: string;
+  airline?: string;
+  cabin?: string;
+  flightNumber?: string;
+}
+
+export interface CarRentalQuoteItem extends QuoteItemBase {
+  type: "car_rental";
+  pickupLocation?: string;
+  dropoffLocation?: string;
+  pickupDate?: string;
+  dropoffDate?: string;
+  pickupTime?: string;
+  dropoffTime?: string;
+  carCategory?: string;
+  withDriver?: boolean;
+}
+
+export interface HotelQuoteItem extends QuoteItemBase {
+  type: "hotel";
+  city?: string;
+  hotelName?: string;
+  checkIn?: string;
+  checkOut?: string;
+  rooms?: number;
+  roomType?: string;
+  guests?: number;
+}
+
+export interface BusQuoteItem extends QuoteItemBase {
+  type: "bus";
+  origin?: string;
+  destination?: string;
+  departureDate?: string;
+  returnDate?: string;
+  busLine?: string;
+  serviceClass?: string;
+}
+
+export type QuoteItem =
+  | FlightQuoteItem
+  | CarRentalQuoteItem
+  | HotelQuoteItem
+  | BusQuoteItem;
+
+export interface QuoteFileRef {
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  storagePath: string | null;
+  uploadError?: string;
+}
+
+export interface QuoteMissingField {
+  itemId: string;
+  field: string;
+  label: string;
+}
+
+export interface QuoteDraft {
+  resumen: string;
+  items: QuoteItem[];
+  notes?: string;
+  files: QuoteFileRef[];
+  missingFields: QuoteMissingField[];
 }
 
 export interface DocumentSourceCitation {

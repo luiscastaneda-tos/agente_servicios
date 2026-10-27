@@ -10,6 +10,13 @@ import {
   TransportSearchQuery,
 } from "../../repositories/interfaces/repositories.interface";
 import { LLMStrategyContext, llmContext } from "../../strategies/llm.context";
+import { env } from "../../config/env";
+import {
+  formatDateEs,
+  isPastDate,
+  parseTravelDate,
+} from "../../utils/date-parser";
+import { dropNulls, parseLenientJson, stripPrices, stripPricesFromList } from "../../utils/price-filter";
 import {
   AgentExecutionResult,
   ChatMessageRecord,
@@ -32,6 +39,7 @@ const TransportOptionSchema: z.ZodType<
   arrivalPoint: z.string().optional(),
   estimatedDuration: z.string().optional(),
   frequencyOrSchedule: z.string().optional(),
+  departureTimes: z.array(z.string()).default([]),
   serviceClass: z.string().optional(),
   vehicleCategory: z.string().optional(),
   highlights: z.array(z.string()).default([]),
@@ -63,6 +71,8 @@ export abstract class BaseTransportSpecialistAgent {
   public abstract readonly serviceType: TransportServiceType;
   protected abstract readonly serviceTitle: string;
   protected abstract readonly specialtyInstructions: string;
+  // Si es true, el agente no busca opciones hasta tener fecha exacta de viaje.
+  protected readonly requiresExactDate: boolean = false;
 
   constructor(
     protected readonly repository: ITransportServiceRepository,
@@ -87,10 +97,35 @@ export abstract class BaseTransportSpecialistAgent {
       activeService: this.serviceType,
     };
 
+    let dateLabel: string | undefined;
+    if (this.requiresExactDate) {
+      const parsedDate = parseTravelDate(userMessage);
+      if (parsedDate?.status === "ok") {
+        mergedQueryState.departureDate = parsedDate.iso;
+      } else if (
+        mergedQueryState.departureDate &&
+        isPastDate(mergedQueryState.departureDate)
+      ) {
+        // La fecha guardada de una sesión vieja ya no sirve
+        mergedQueryState.departureDate = undefined;
+      }
+
+      const missingPlaces = !mergedQueryState.origin || !mergedQueryState.destination;
+      if (parsedDate?.status === "past" || !mergedQueryState.departureDate || missingPlaces) {
+        return this.buildClarificationResult({
+          session,
+          state: mergedQueryState,
+          pastDateIso: parsedDate?.status === "past" ? parsedDate.iso : undefined,
+          startTime,
+        });
+      }
+      dateLabel = formatDateEs(mergedQueryState.departureDate);
+    }
+
     const searchQuery: TransportSearchQuery = {
       origin: mergedQueryState.origin,
       destination: mergedQueryState.destination,
-      date: mergedQueryState.departureDate,
+      date: dateLabel ?? mergedQueryState.departureDate,
       passengers: mergedQueryState.passengers,
       extraContext: userMessage,
     };
@@ -108,9 +143,15 @@ export abstract class BaseTransportSpecialistAgent {
 ${this.specialtyInstructions}
 
 REGLAS ESTRICTAS DE NEGOCIO Y GUARDRAILS:
-1. PROHIBIDO INVENTAR O MOSTRAR PRECIOS EN VIVO: NO incluyas tarifas monetarias ($ MXN / USD) ni precios dinámicos en tiempo real. Enfócate en operadores reales, rutas, terminales/aeropuertos/puertos/estaciones, duración estimada, frecuencias, categorías de servicio y requisitos.
+1. PROHIBIDO MENCIONAR PRECIOS: NO incluyas tarifas, costos ni montos ($ MXN / USD / "pesos") en ninguna parte, aunque aparezcan en el contexto web. Enfócate en operadores reales (marca), rutas, terminales/aeropuertos/puertos/estaciones, horarios de salida, duración estimada, frecuencias, categorías de servicio y requisitos.
+1b. NO INVENTES HORARIOS: usa en "departureTimes" únicamente horas que aparezcan en el contexto web (formato 24h, ej. "07:30"). Si no hay horarios confiables, deja "departureTimes" como [] y describe la frecuencia general en "frequencyOrSchedule" solo si el contexto la respalda; si no, omítela. Nunca rellenes con horas supuestas.
+1c. "answer" es texto Markdown breve y directo (máx. ~120 palabras) para leer en un chat: NO incluyas JSON, bloques de código ni la lista completa de opciones (ya se muestra en tarjetas).
 2. MEMORIA DE ESTADO COMPARTIDA (TravelState): Fusiona el estado de viaje actual de la sesión con cualquier nuevo dato del usuario (origen, destino, fecha, pasajeros). Si el usuario ya había mencionado un origen/destino en mensajes anteriores (ej. "de CDMX a Oaxaca") y ahora pregunta "¿y en ${this.serviceTitle.toLowerCase()}?", mantén ese mismo origen y destino.
-3. Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exacta:
+${
+  dateLabel
+    ? `2b. FECHA DE VIAJE: el usuario viaja el ${dateLabel} (${mergedQueryState.departureDate}). Menciona esta fecha exacta en "answer" y usa "${mergedQueryState.departureDate}" en updatedTravelState.departureDate. Los horarios y la frecuencia son información de REFERENCIA GENERAL de la ruta: NO afirmes disponibilidad, asientos ni horarios exactos para esa fecha, e indica que deben confirmarse para ${dateLabel} en la terminal o el sitio oficial.\n`
+    : ""
+}3. Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exacta:
 {
   "answer": "Explicación clara, ejecutiva y útil en Markdown (SIN precios en vivo)...",
   "updatedTravelState": {
@@ -128,7 +169,8 @@ REGLAS ESTRICTAS DE NEGOCIO Y GUARDRAILS:
       "departurePoint": "Aeropuerto / Terminal / Puerto / Estación de salida",
       "arrivalPoint": "Aeropuerto / Terminal / Puerto / Estación de llegada",
       "estimatedDuration": "Duración estimada ej. 1h 25m o 6h 30m",
-      "frequencyOrSchedule": "Frecuencia ej. Salidas cada hora / 3 vuelos diarios",
+      "frequencyOrSchedule": "Frecuencia ej. Salidas cada hora / 3 vuelos diarios (solo si el contexto lo respalda)",
+      "departureTimes": ["07:00", "08:30"],
       "serviceClass": "Clase ej. Ejecutiva, Primera, Turista, Lujo",
       "vehicleCategory": "Categoría de unidad ej. Boeing 737, SUV Ejecutiva, Autobús Doble Piso",
       "highlights": ["Ventaja o requisito 1", "Ventaja o requisito 2"],
@@ -155,13 +197,14 @@ ${rawSearchContext}
 
 Mensaje actual del usuario: "${userMessage}"
 
-Genera el objeto JSON con las mejores opciones reales de ${this.serviceTitle}.`;
+${dateLabel ? `Fecha de viaje solicitada: ${dateLabel}.\n` : ""}Genera el objeto JSON con las mejores opciones reales de ${this.serviceTitle}.`;
 
     const llmResult = await this.llm.invokeWithFallback(
       [new SystemMessage(systemPrompt), new HumanMessage(userPrompt)],
       {
         temperature: 0.2,
-        maxOutputTokens: 2048,
+        // Gemini 2.5 consume parte de este límite "pensando"; con 2048 el JSON llegaba cortado.
+        maxOutputTokens: 8192,
         preferredProvider,
       }
     );
@@ -171,12 +214,28 @@ Genera el objeto JSON con las mejores opciones reales de ${this.serviceTitle}.`;
       mergedQueryState,
       webSources
     );
+    parsed.answer = stripPrices(parsed.answer);
+    parsed.options = parsed.options.map((opt) => ({
+      ...opt,
+      highlights: stripPricesFromList(opt.highlights),
+      frequencyOrSchedule: opt.frequencyOrSchedule
+        ? stripPrices(opt.frequencyOrSchedule)
+        : undefined,
+    }));
 
     const finalTravelState: Partial<TravelState> = {
       ...mergedQueryState,
       ...parsed.updatedTravelState,
       activeService: this.serviceType,
     };
+
+    if (dateLabel && mergedQueryState.departureDate) {
+      // El LLM no decide la fecha: se queda la que entendió el parser.
+      finalTravelState.departureDate = mergedQueryState.departureDate;
+      if (!parsed.answer.toLowerCase().includes(dateLabel.toLowerCase())) {
+        parsed.answer = `Viaje para el **${dateLabel}**.\n\n${parsed.answer}`;
+      }
+    }
 
     const routeLabel =
       finalTravelState.origin && finalTravelState.destination
@@ -227,42 +286,101 @@ Genera el objeto JSON con las mejores opciones reales de ${this.serviceTitle}.`;
     };
   }
 
+  // Respuesta sin búsqueda web ni LLM: pide lo que falta para poder cotizar.
+  private buildClarificationResult(params: {
+    session: SessionState;
+    state: TravelState;
+    pastDateIso?: string;
+    startTime: number;
+  }): AgentExecutionResult {
+    const { session, state, pastDateIso, startTime } = params;
+    const route =
+      state.origin && state.destination
+        ? `de ${state.origin} a ${state.destination}`
+        : "";
+
+    const missing: string[] = [];
+    if (!state.origin) missing.push("de dónde sales");
+    if (!state.destination) missing.push("a dónde viajas");
+
+    let answer: string;
+    if (pastDateIso) {
+      answer = `Esa fecha (${formatDateEs(pastDateIso)}) ya pasó. ¿Me indicas una fecha futura para tu viaje${route ? ` ${route}` : ""}?`;
+    } else if (missing.length > 0) {
+      answer = `Con gusto te ayudo con ${this.serviceTitle.toLowerCase()}. Para cotizar necesito saber ${missing.join(" y ")}, y la **fecha exacta** en la que quieres viajar. Si viajas más de una persona, dime cuántas.`;
+    } else {
+      answer = `Perfecto, ${this.serviceTitle.toLowerCase()} ${route}. ¿Para qué **fecha exacta** quieres viajar? Si son varias personas, dime cuántas.`;
+    }
+
+    const messagesUsed = session.messagesUsed + 1;
+    return {
+      answer,
+      uiPayload: { type: "none" },
+      suggestedActions: ["Mañana", "El próximo viernes", "Ida y vuelta"],
+      updatedTravelState: {
+        ...state,
+        activeService: this.serviceType,
+      },
+      metadata: {
+        sessionId: session.sessionId,
+        agentUsed: this.serviceType,
+        providerUsed: env.defaultProvider,
+        modelUsed: "sin-llm",
+        fallbackTriggered: false,
+        tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        latencyMs: Date.now() - startTime,
+        sources: [],
+        webSourcesUsed: [],
+        quota: {
+          messagesUsed,
+          maxMessages: session.maxMessages,
+          messagesRemaining: Math.max(0, session.maxMessages - messagesUsed),
+          filesUploaded: session.filesUploaded,
+          maxFiles: session.maxFiles,
+        },
+      },
+    };
+  }
+
   protected extractRouteHints(
     message: string,
     currentState: TravelState
   ): Partial<TravelState> {
     const hints: Partial<TravelState> = {};
 
-    // Pattern: "de X a Y" or "desde X hasta/hacia/a Y"
-    const routeMatch = message.match(
-      /\b(?:de|desde)\s+([A-Za-zÁÉÍÓÚáéíóúÑñ\s]{2,30}?)\s+(?:a|hacia|hasta|para)\s+([A-Za-zÁÉÍÓÚáéíóúÑñ\s]{2,30}?)(?:[,.?¿!]|$|\s+(?:el|en|para|con|mañana|hoy))/i
-    );
+    const stopWords = new Set([
+      "ir", "viajar", "vuelo", "vuelos", "autobús", "autobus", "autobuses",
+      "camión", "camion", "camiones", "tren", "trenes", "ferry", "ferrys",
+      "auto", "autos", "renta", "chofer", "boleto", "boletos", "transporte",
+      "viaje", "viajes", "corridas", "horarios",
+    ]);
+    const cityRe = "([A-Za-zÁÉÍÓÚáéíóúÑñ.]+(?:\\s+[A-Za-zÁÉÍÓÚáéíóúÑñ.]+){0,3}?)";
+    const tail = "(?=\\s*(?:[,.?¿!]|$|\\s(?:el|en|con|mañana|hoy|para|que|por|\\d)))";
+    const patterns: Array<{ re: RegExp; originIdx: number; destIdx: number }> = [
+      // "para/a/hacia X desde Y"
+      { re: new RegExp(`\\b(?:a|hacia|hasta|para)\\s+${cityRe}\\s+desde\\s+${cityRe}${tail}`, "i"), originIdx: 2, destIdx: 1 },
+      // "desde Y a/hacia/hasta/para X"
+      { re: new RegExp(`\\bdesde\\s+${cityRe}\\s+(?:a|hacia|hasta|para)\\s+${cityRe}${tail}`, "i"), originIdx: 1, destIdx: 2 },
+      // "de Y a/hacia/hasta X"
+      { re: new RegExp(`\\bde\\s+${cityRe}\\s+(?:a|hacia|hasta)\\s+${cityRe}${tail}`, "i"), originIdx: 1, destIdx: 2 },
+    ];
 
-    if (routeMatch) {
-      const candidateOrigin = routeMatch[1].trim();
-      const candidateDest = routeMatch[2].trim();
-      const stopWords = new Set([
-        "ir",
-        "viajar",
-        "vuelo",
-        "vuelos",
-        "autobús",
-        "autobus",
-        "camión",
-        "tren",
-        "ferry",
-        "auto",
-        "autos",
-        "renta",
-        "chofer",
-      ]);
-      if (!stopWords.has(candidateOrigin.toLowerCase())) {
-        hints.origin = candidateOrigin;
+    let routeFound = false;
+    for (const { re, originIdx, destIdx } of patterns) {
+      const m = message.match(re);
+      if (!m) continue;
+      const origin = m[originIdx].trim();
+      const destination = m[destIdx].trim();
+      if (stopWords.has(origin.toLowerCase()) || stopWords.has(destination.toLowerCase())) {
+        continue;
       }
-      if (!stopWords.has(candidateDest.toLowerCase())) {
-        hints.destination = candidateDest;
-      }
-    } else if (!currentState.destination) {
+      hints.origin = this.normalizeCity(origin);
+      hints.destination = this.normalizeCity(destination);
+      routeFound = true;
+      break;
+    }
+
+    if (!routeFound && !currentState.destination) {
       const destOnlyMatch = message.match(
         /\b(?:en|hacia|para|a)\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑa-záéíóúñ]+){0,2})/
       );
@@ -279,6 +397,31 @@ Genera el objeto JSON con las mejores opciones reales de ${this.serviceTitle}.`;
     return hints;
   }
 
+  private normalizeCity(city: string): string {
+    const aliases: Record<string, string> = {
+      cdmx: "Ciudad de México",
+      df: "Ciudad de México",
+      "d.f.": "Ciudad de México",
+      "mexico city": "Ciudad de México",
+      gdl: "Guadalajara",
+      mty: "Monterrey",
+    };
+    const key = city.trim().toLowerCase();
+    if (aliases[key]) return aliases[key];
+    return city.charAt(0).toUpperCase() + city.slice(1);
+  }
+
+  // Si el modelo se cortó a mitad del JSON, recupera al menos el texto de "answer".
+  private salvageAnswer(raw: string): string | null {
+    const m = raw.match(/"answer"\s*:\s*"((?:[^"\\]|\\.)*)/);
+    if (!m || !m[1]) return null;
+    try {
+      return JSON.parse(`"${m[1]}"`);
+    } catch {
+      return m[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\$/, "");
+    }
+  }
+
   private parseTransportOutput(
     rawOutput: string,
     fallbackState: TravelState,
@@ -292,8 +435,14 @@ Genera el objeto JSON con las mejores opciones reales de ${this.serviceTitle}.`;
     const jsonCandidate = this.guardrails.extractJsonString(rawOutput);
     if (jsonCandidate) {
       try {
-        const parsed = JSON.parse(jsonCandidate);
+        const parsed = dropNulls(parseLenientJson(jsonCandidate));
         const validated = TransportLLMResponseSchema.safeParse(parsed);
+        if (!validated.success) {
+          console.warn(
+            `[${this.serviceType}] Respuesta del LLM no cumple el esquema:`,
+            JSON.stringify(validated.error.issues.slice(0, 5))
+          );
+        }
         if (validated.success) {
           return {
             answer: validated.data.answer,
@@ -305,8 +454,10 @@ Genera el objeto JSON con las mejores opciones reales de ${this.serviceTitle}.`;
                 : this.getDefaultSuggestedActions(fallbackState),
           };
         }
-      } catch {
-        // Fallback below
+      } catch (err) {
+        console.warn(
+          `[${this.serviceType}] JSON del LLM inválido: ${(err as Error).message}. Inicio: ${jsonCandidate.slice(0, 200)}`
+        );
       }
     }
 
@@ -323,8 +474,15 @@ Genera el objeto JSON con las mejores opciones reales de ${this.serviceTitle}.`;
             sourceUrl: src.url,
           }));
 
+    const looksLikeJson = /```json|^\s*\{/.test(rawOutput);
+    const answer =
+      this.salvageAnswer(rawOutput) ??
+      (looksLikeJson
+        ? "Encontré información de la ruta pero no pude estructurarla completa. Intenta de nuevo en un momento o consulta las fuentes de abajo."
+        : sanitized.answer);
+
     return {
-      answer: sanitized.answer,
+      answer,
       updatedTravelState: sanitized.updatedTravelState || fallbackState,
       options: fallbackOptions,
       suggestedActions: this.getDefaultSuggestedActions(fallbackState),
@@ -381,9 +539,10 @@ export class TrainAgent extends BaseTransportSpecialistAgent {
 
 export class BusAgent extends BaseTransportSpecialistAgent {
   public readonly serviceType: TransportServiceType = "bus";
+  protected readonly requiresExactDate = true;
   protected readonly serviceTitle = "Autobuses Foráneos y Ejecutivos";
   protected readonly specialtyInstructions =
-    "Especialista en líneas de autobuses terrestres (ej. ETN Turistar Lujo, ADO Platino / GL, Primera Plus, Estrella Blanca, Futura Select, Ómnibus de México), centrales camioneras específicas (ej. TAPO, Terminal Norte, Observatorio, Sur Taxqueña), clases de servicio (Lujo, Ejecutivo, Primera) y duración aproximada por carretera.";
+    "Especialista en líneas de autobuses terrestres (ej. ETN Turistar Lujo, ADO Platino / GL, Primera Plus, Estrella Blanca, Futura Select, Ómnibus de México), centrales camioneras específicas (ej. TAPO, Terminal Norte, Observatorio, Sur Taxqueña), clases de servicio (Lujo, Ejecutivo, Primera) y duración aproximada por carretera. Para CADA opción indica la MARCA/línea en \"provider\" (ej. ADO, ETN, Pullman de Morelos, Estrella Roja, Primera Plus), la terminal de salida y llegada, la clase de servicio y, solo si aparecen en el contexto web, los horarios de salida en \"departureTimes\". Si no hay horarios confiables, entrega igualmente la marca, terminal y clase, y recomienda confirmar corridas en la terminal o sitio oficial. Entrega entre 3 y 6 opciones distintas, una por marca.";
 }
 
 export class GeneralMiaAgent {

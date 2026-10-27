@@ -16,6 +16,7 @@ export const env = {
   embeddingDimensions: Number(process.env.EMBEDDING_DIMENSIONS || 768),
   supabaseUrl: process.env.SUPABASE_URL || "",
   supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || "",
+  cotizacionesBucket: process.env.COTIZACIONES_BUCKET || "cotizaciones-mia",
   maxMessagesPerSession: Number(process.env.MAX_MESSAGES_PER_SESSION || 25),
   maxFilesPerSession: Number(process.env.MAX_FILES_PER_SESSION || 3),
   maxFileSizeMb: Number(process.env.MAX_FILE_SIZE_MB || 4),

@@ -24,6 +24,7 @@
     "cors": "^2.8.5",
     "d3-dsv": "^3.0.1",
     "dotenv": "^16.4.7",
+    "exceljs": "^4.4.0",
     "express": "^4.21.2",
     "js-tiktoken": "^1.0.19",
     "langchain": "^0.3.19",

@@ -4,6 +4,90 @@ Documento de entrega técnica y guía de operación del microservicio de Intelig
 
 ---
 
+## 0. Estado actual (actualizado 26-oct-2026)
+
+> Esta sección es la fuente de verdad de **dónde nos quedamos**. Las secciones 1–4 son la documentación base del servicio y siguen vigentes salvo donde se indica.
+
+### 0.1 Lo que llevamos
+
+1. **Agente de autobuses** (`BusAgent`): ya devuelve **marca/línea, terminal, clase de servicio y duración**, sin precios.
+   - Pide la **fecha exacta** antes de buscar (`requiresExactDate`; parser en [`src/utils/date-parser.ts`](./src/utils/date-parser.ts): "mañana", "el viernes", "15 de noviembre", ISO…; rechaza fechas pasadas).
+   - Horarios de salida: **no hay fuente confiable** (las páginas de ETN/ADO cargan las corridas con JavaScript y las APIs no son públicas). Decisión: la tarjeta dice "Horarios por confirmar en terminal o sitio oficial"; solo se muestran horas si aparecen en los resultados web, nunca se inventan.
+   - Causas que se corrigieron: respuestas de Gemini cortadas por `maxOutputTokens` (2048 → 8192), `null` en campos desconocidos, comas sobrantes en el JSON y ruta mal leída ("autobuses para X desde Y").
+   - Filtro de precios compartido: [`src/utils/price-filter.ts`](./src/utils/price-filter.ts) (`stripPrices`, `dropNulls`, `parseLenientJson`).
+2. **Memoria entre recargas**: el front guarda el `sessionId` por usuario en `localStorage` y restaura la sesión con `GET /api/v1/chat/session/:id`. Botón **"Nueva conversación"** en el chat.
+3. **Front (`mia`)**: se quitaron "Estado del Viaje", el banner azul del servicio, "Fuentes y Fragmentos", la barra de documentos tokenizados y el lienzo inicial; las tarjetas ya no muestran "Sitio oficial / Fuente" (el enlace se conserva en "Mi Selección" para el empleado).
+4. **Supabase**: mia_ai usa el proyecto de MIA (`iyuom…`) y las tablas de [`sql/supabase_setup.sql`](./sql/supabase_setup.sql) ya están creadas ahí. `bacl` se alineó al mismo proyecto (la impersonación admin → mia funciona).
+5. **Cotizaciones (nuevo, ver 0.2)**: agente que convierte texto, PDF, imagen, CSV o Excel en una solicitud de cotización para Operaciones.
+
+### 0.2 Cotizaciones: cómo funciona
+
+```
+mia (modo "Solicitar cotización")
+  → POST /api/v1/chat { mode:"quote", currentDraft?, files[0..3] }
+  → QuoteAgent (src/agents/quote/): lee texto / PDF / CSV / .xlsx / imagen (visión),
+    1 llamada LLM con esquema Zod, SIN precios, originales a Supabase Storage (bucket privado)
+  → uiPayload { type:"quote_draft", quoteDraft }  → borrador editable en mia
+  → (usuario confirma) POST bacl /v2/mia/cotizaciones-ia
+  → MySQL de bacl: cotizaciones_ia + cotizaciones_ia_archivos
+  → admin_mia /dashboard/cotizaciones-ia (permiso view.cotizaciones_ia), solo lectura;
+    "Abrir" pide a bacl una URL firmada de 300 s del archivo original
+```
+
+- **Por qué un camino separado**: el flujo antiguo (`POST /mia/solicitud` con `tradicional:false`) mete la solicitud al **carrito de pago** y exige `total`; Stripe suma esos totales. Una cotización sin precio no cabe ahí.
+- **Tipos**: `flight`, `car_rental`, `hotel`, `bus`. El **autobús** es una cotización más: el sistema de reservas no lo soporta, Operaciones lo resuelve fuera del sistema.
+- **Sin precios**: no se extraen, no se guardan, no se muestran (Operaciones los pone). bacl rechaza con 400 cualquier clave de precio.
+- **Sin correo**: la lectura de correos quedó fuera del alcance.
+- **Dónde está cada cosa**:
+
+| Repo | Qué | Ruta |
+| :--- | :--- | :--- |
+| `mia_ai` | Agente, esquema Zod, lectores, subida de originales, `zip-guard` | `src/agents/quote/`, `src/repositories/quote-storage.repository.ts`, `src/utils/zip-guard.ts` |
+| `bacl` | SQL + módulo (validación, repositorio, URL firmada, rate limit) | `sql/cotizaciones_ia.sql`, `api/modules/cotizacionesIa/`, `v2/router/mia.js` |
+| `mia` | Modo cotización, borrador editable, confirmación | `src/components/organism/mia-ai/QuoteDraftPanel.tsx`, `src/services/CotizacionIaService.ts`, `src/utils/quoteDraft.ts` |
+| `admin_mia` | Vista de cotizaciones (lista, detalle, archivos) | `app/dashboard/cotizaciones-ia/`, `angel/**` |
+
+- **Campos requeridos para confirmar**: vuelo (origen, destino, salida) · renta de auto (lugar y fechas de recogida/entrega) · hotel (ciudad u hotel, entrada, salida) · autobús (origen, destino, salida). Fechas ISO `YYYY-MM-DD`.
+- `mia_ai` **recorta** el borrador a los límites de validación de bacl (`cotizacionesIa.schema.js`) para no provocar 400 por longitud.
+
+### 0.3 PASOS MANUALES (lo que debe hacer una persona)
+
+**Para que cotizaciones funcione (en este orden):**
+1. Correr `bacl/sql/cotizaciones_ia.sql` en la base MySQL de bacl. **En local, bacl apunta a producción**: revisar antes. Solo agrega (tablas nuevas + permiso), no modifica lo existente.
+2. Crear el bucket **privado** `cotizaciones-mia` en Supabase Storage (proyecto de MIA). Otro nombre → variable `COTIZACIONES_BUCKET` en `bacl` y `mia_ai`. Sin bucket, el borrador sale con `uploadError` y no se guarda el original.
+3. Otorgar el permiso `view.cotizaciones_ia` a PATY y Operaciones (bloque comentado al final del `.sql`). Es distinto del permiso viejo `view.cotizaciones` (correos procesados).
+4. Poner una llave de IA **con cuota**: la cuota gratuita de Gemini se agotó (429) y `OPENAI_API_KEY` sigue con el valor de ejemplo. Sin esto no hay pruebas con modelo real ni respaldo.
+5. `npm install` en cada entorno donde se despliegue `mia_ai` (nueva dependencia `exceljs`).
+
+**Para validar:**
+6. Prueba de punta a punta: en mia activar "Solicitar cotización" → texto y archivo → editar → confirmar → abrir la cotización y su archivo en `/dashboard/cotizaciones-ia`.
+7. Revisión visual (los agentes no ven el navegador): modo cotización, borrador, móvil, "Reenviar de todos modos", "Nueva conversación".
+8. En desarrollo `usePermiso` da `true` a todos: comprobar el ocultamiento por permiso en un entorno con permisos reales.
+
+**Hallazgos ajenos a cotizaciones (pendientes de arreglar):**
+9. Preguntar sobre un PDF/CSV ya subido falla: `text-embedding-004` responde 404 (actualizar `GEMINI_EMBEDDING_MODEL` o usar OpenAI) y a `mia_document_chunks` le faltan las columnas `file_name text`, `file_type text`, `chunk_index int`, `token_count int` (el código las inserta; hoy los vectores caen a memoria local).
+
+### 0.4 Pendiente / siguientes pasos
+
+- **Seguridad del POST de cotizaciones**: la `x-api-key` viaja en el bundle del frontend, así que `id_usuario` es declarativo (ya se valida que `storage_path` empiece con la carpeta del propio usuario). Recomendado: validar la sesión de MIA en bacl, y registrar quién abre cada archivo. El rate limit (20 solicitudes/10 min por IP) es en memoria y **por instancia** (en Vercel no es exacto).
+- **Idempotencia**: un reintento tras perder la respuesta puede duplicar la cotización (el front avisa en vez de reintentar a ciegas).
+- **Hoteles en el chat con IA**: en espera. Hay una integración candidata (NEMU, repo aparte) por evaluar; mia ya tiene su propio catálogo de hoteles en la parte de reservas.
+- **Mejoras del agente de autobuses**: subir el historial que ven los agentes de transporte de 4 a 6 mensajes (`recentHistory.slice(-4)`); horarios reales solo con convenio/API de pago (Busbud/Reservamos), descartado por ahora.
+- **Revisar aparte**: la rama de `classifyIntent` que continúa el servicio activo con fecha/pasajeros afecta el enrutado de transporte; errores conocidos de `createCartItem`/`createSolicitudes` en bacl `/v1` (tipo desconocido → 500, `catch` que usa `res` fuera de alcance); `tsc` de `admin_mia` no revisa tipos por su `ignoreDeprecations`; `StayCalendar.tsx` (mia) tiene un error de sintaxis previo.
+- **Límites del lector de archivos**: sin OCR (PDF escaneado → subir como imagen); `.xls` antiguo no se lee (solo `.xlsx`); PDF limitado a 30 páginas; xlsx limitado a 20 MB descomprimido y 200 entradas.
+
+### 0.5 Variables de entorno nuevas o relevantes
+
+| Variable | Uso |
+| :--- | :--- |
+| `COTIZACIONES_BUCKET` | Bucket privado de Storage (default `cotizaciones-mia`), en `mia_ai` y `bacl` |
+| `TAVILY_API_KEY` | Búsqueda web (opcional; sin ella cae a DuckDuckGo, que es frágil) |
+| `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | Si están vacías, sesiones y vectores viven en memoria y se pierden al reiniciar |
+
+> Nunca subir `.env`. Si la `service_role` se expone, rotarla en Supabase (Settings → API) y actualizarla en `bacl` y `mia_ai`.
+
+---
+
 ## 1. ¿Qué fue lo que construimos?
 
 Diseñamos e implementamos una arquitectura **Multi-Agente con RAG (PDF/CSV) y Búsqueda Web en Tiempo Real**, siguiendo patrones de diseño limpios (**Strategy**, **Repository**, **Orchestrator/Router**) y **Guardrails de producción**:
@@ -40,7 +124,7 @@ Diseñamos e implementamos una arquitectura **Multi-Agente con RAG (PDF/CSV) y B
   - **Quota Guardrail**: Límite configurable por sesión (por defecto **25 mensajes** y **3 archivos** por sesión).
   - **Output Guardrail**: Validación de respuestas estructuradas con `Zod` (`uiPayload`, `suggestedActions`, `updatedTravelState`).
 
-### D. 9 Agentes Especializados + Router Orquestador (`src/agents/`)
+### D. 10 Agentes Especializados + Router Orquestador (`src/agents/`)
 - **[`AgentRouterOrchestrator`](./src/agents/agent-router.orchestrator.ts)**: Clasifica la intención del usuario y delega al agente experto:
   1. **`FlightAgent`**: Aerolíneas que operan la ruta, aeropuertos IATA, escalas y duración estimada (sin precios en vivo).
   2. **`CarRentalAgent`**: Arrendadoras en el destino, categorías de autos, puntos de entrega y requisitos.
@@ -51,6 +135,7 @@ Diseñamos e implementamos una arquitectura **Multi-Agente con RAG (PDF/CSV) y B
   7. **`PdfSpecialistAgent`**: Temperatura `0.1`, lectura profunda de PDFs con etiquetas XML `<contexto_pdf>` y citas exactas de página (`[Página X]`).
   8. **`CsvAnalystAgent`**: Temperatura `0.0`, análisis tabular exacto combinando el chunk estadístico global + filas tokenizadas, devolviendo tablas (`uiPayload.type = "table"`) o tarjetas de KPIs.
   9. **`GeneralMiaAgent`**: Asistente general de viajes para saludos o aclaraciones.
+  10. **`QuoteAgent`** ([`src/agents/quote/`](./src/agents/quote/quote.agent.ts)): no es un orquestador de los agentes de transporte; **lee y estructura** lo que el usuario ya sabe que quiere (texto, PDF, CSV, Excel, imagen) en un borrador de cotización sin precios. Ver sección 0.2.
 
 ---
 
@@ -111,7 +196,7 @@ npm start
 | :--- | :--- | :--- |
 | `GET` | `/api/v1/health` | Verifica el estado del servicio, proveedores activos, conexión a Supabase y cuotas. |
 | `POST` | `/api/v1/documents/ingest` | Recibe `multipart/form-data` (`file`, `sessionId`, `userId`, `provider`), tokeniza el PDF o CSV con LangChain y almacena sus vectores. |
-| `POST` | `/api/v1/chat` | Recibe JSON o `multipart/form-data` (`sessionId`, `userId`, `message`, `provider`, `file?`), ejecuta el agente especializado y devuelve `{ answer, uiPayload, suggestedActions, updatedTravelState, metadata }`. |
+| `POST` | `/api/v1/chat` | Recibe JSON o `multipart/form-data` (`sessionId`, `userId`, `message`, `provider`, `file?`), ejecuta el agente especializado y devuelve `{ answer, uiPayload, suggestedActions, updatedTravelState, metadata }`. Para cotizaciones: `mode:"quote"`, `currentDraft?` y `files` (0–3, máx. 4 MB c/u: pdf, csv, xlsx, png, jpg, webp) → `uiPayload.type = "quote_draft"`. El campo `file` (uno solo) sigue siendo la ingesta RAG. |
 | `GET` | `/api/v1/chat/session/:sessionId` | Devuelve el estado completo de la sesión (`travelState`, documentos tokenizados, cuota e historial de mensajes con sus `uiPayload`). |
 
 ---
