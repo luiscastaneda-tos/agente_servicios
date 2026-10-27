@@ -4,7 +4,7 @@ Documento de entrega técnica y guía de operación del microservicio de Intelig
 
 ---
 
-## 0. Estado actual (actualizado 26-oct-2026)
+## 0. Estado actual (actualizado 27-oct-2026)
 
 > Esta sección es la fuente de verdad de **dónde nos quedamos**. Las secciones 1–4 son la documentación base del servicio y siguen vigentes salvo donde se indica.
 
@@ -13,74 +13,94 @@ Documento de entrega técnica y guía de operación del microservicio de Intelig
 1. **Agente de autobuses** (`BusAgent`): ya devuelve **marca/línea, terminal, clase de servicio y duración**, sin precios.
    - Pide la **fecha exacta** antes de buscar (`requiresExactDate`; parser en [`src/utils/date-parser.ts`](./src/utils/date-parser.ts): "mañana", "el viernes", "15 de noviembre", ISO…; rechaza fechas pasadas).
    - Horarios de salida: **no hay fuente confiable** (las páginas de ETN/ADO cargan las corridas con JavaScript y las APIs no son públicas). Decisión: la tarjeta dice "Horarios por confirmar en terminal o sitio oficial"; solo se muestran horas si aparecen en los resultados web, nunca se inventan.
-   - Causas que se corrigieron: respuestas de Gemini cortadas por `maxOutputTokens` (2048 → 8192), `null` en campos desconocidos, comas sobrantes en el JSON y ruta mal leída ("autobuses para X desde Y").
    - Filtro de precios compartido: [`src/utils/price-filter.ts`](./src/utils/price-filter.ts) (`stripPrices`, `dropNulls`, `parseLenientJson`).
 2. **Memoria entre recargas**: el front guarda el `sessionId` por usuario en `localStorage` y restaura la sesión con `GET /api/v1/chat/session/:id`. Botón **"Nueva conversación"** en el chat.
-3. **Front (`mia`)**: se quitaron "Estado del Viaje", el banner azul del servicio, "Fuentes y Fragmentos", la barra de documentos tokenizados y el lienzo inicial; las tarjetas ya no muestran "Sitio oficial / Fuente" (el enlace se conserva en "Mi Selección" para el empleado).
+3. **Front (`mia`)**: el chat de MIA AI Studio **siempre está en modo cotización** (ya no hay toggle ni chat general) — se quitó la pestaña "Mi Selección / Itinerario" y sus componentes (`MiaSelectedItineraryPanel`, `MiaStudioStatusBar`), sin uso desde que no existe el chat general que los alimentaba.
 4. **Supabase**: mia_ai usa el proyecto de MIA (`iyuom…`) y las tablas de [`sql/supabase_setup.sql`](./sql/supabase_setup.sql) ya están creadas ahí. `bacl` se alineó al mismo proyecto (la impersonación admin → mia funciona).
-5. **Cotizaciones (nuevo, ver 0.2)**: agente que convierte texto, PDF, imagen, CSV o Excel en una solicitud de cotización para Operaciones.
+5. **Cotizaciones**: agente que convierte texto, PDF, imagen, CSV o Excel en una solicitud de cotización para Operaciones — **ya en producción, con opciones reales por ítem** (ver 0.2). SQL corrido, bucket creado, permiso otorgado: el flujo completo ya se probó de punta a punta.
 
 ### 0.2 Cotizaciones: cómo funciona
 
 ```
-mia (modo "Solicitar cotización")
+mia (chat siempre en modo cotización)
   → POST /api/v1/chat { mode:"quote", currentDraft?, files[0..3] }
   → QuoteAgent (src/agents/quote/): lee texto / PDF / CSV / .xlsx / imagen (visión),
     1 llamada LLM con esquema Zod, SIN precios, originales a Supabase Storage (bucket privado)
-  → uiPayload { type:"quote_draft", quoteDraft }  → borrador editable en mia
+  → por cada item flight/car_rental/bus con datos suficientes: enrichWithFoundOptions()
+    reutiliza FlightAgent/CarRentalAgent/BusAgent (los mismos de siempre, no se
+    reinventa busqueda) para anexar hasta 3 opciones reales sin precio -- con
+    carry-forward entre turnos si no cambian origen/destino/fecha
+  → uiPayload { type:"quote_draft", quoteDraft }  → borrador editable en mia,
+    cada item con boton "Elegir"/"Cambiar" que abre un modal (TransportOptionCard
+    reusado) para marcar la preferida (preferredOptionId)
   → (usuario confirma) POST bacl /v2/mia/cotizaciones-ia
-  → MySQL de bacl: cotizaciones_ia + cotizaciones_ia_archivos
-  → admin_mia /dashboard/cotizaciones-ia (permiso view.cotizaciones_ia), solo lectura;
+  → MySQL de bacl: cotizaciones_ia + cotizaciones_ia_archivos (incluye foundOptions
+    y preferredOptionId dentro del JSON de items)
+  → admin_mia /dashboard/cotizaciones-ia (permiso view.cotizaciones_ia), solo lectura,
+    muestra las opciones encontradas y cual prefirio el cliente;
     "Abrir" pide a bacl una URL firmada de 300 s del archivo original
 ```
 
+- **Opciones encontradas, solo flight/car_rental/bus** (nunca hotel -- mia ya tiene su propio catalogo de hoteles en otra parte, mezclar fue decision explicita de dejarlo fuera). Si el item es elegible (tiene origen/destino o lugar de recoleccion) pero no trae opciones, el borrador muestra "No se pudieron buscar opciones por ahora" en vez de quedarse mudo.
+- **El LLM de extraccion no sabe nada de foundOptions/preferredOptionId** -- nunca los devuelve, por eso `quote.agent.ts` los repone a mano cada turno (`carryForwardFoundOptions`) y los quita del JSON que arma el prompt (`buildUserMessage`) para que el modelo no los altere al regenerar el item.
+- **Archivos ya subidos en el chat (antes de confirmar)**: se muestran debajo de los mensajes, con boton para abrirlos. Usan un endpoint nuevo de bacl (`GET /cotizaciones-ia/archivos/url`) distinto al de Operaciones, porque antes de confirmar el archivo vive solo en Storage, sin fila en `cotizaciones_ia_archivos` todavia.
 - **Por qué un camino separado**: el flujo antiguo (`POST /mia/solicitud` con `tradicional:false`) mete la solicitud al **carrito de pago** y exige `total`; Stripe suma esos totales. Una cotización sin precio no cabe ahí.
 - **Tipos**: `flight`, `car_rental`, `hotel`, `bus`. El **autobús** es una cotización más: el sistema de reservas no lo soporta, Operaciones lo resuelve fuera del sistema.
-- **Sin precios**: no se extraen, no se guardan, no se muestran (Operaciones los pone). bacl rechaza con 400 cualquier clave de precio.
+- **Sin precios**: no se extraen, no se guardan, no se muestran (Operaciones los pone). bacl rechaza con 400 cualquier clave de precio. El mensaje cuando fallan los proveedores de IA tampoco dice cuales son (antes decia "Gemini y OpenAI" literal).
 - **Sin correo**: la lectura de correos quedó fuera del alcance.
 - **Dónde está cada cosa**:
 
 | Repo | Qué | Ruta |
 | :--- | :--- | :--- |
-| `mia_ai` | Agente, esquema Zod, lectores, subida de originales, `zip-guard` | `src/agents/quote/`, `src/repositories/quote-storage.repository.ts`, `src/utils/zip-guard.ts` |
-| `bacl` | SQL + módulo (validación, repositorio, URL firmada, rate limit) | `sql/cotizaciones_ia.sql`, `api/modules/cotizacionesIa/`, `v2/router/mia.js` |
-| `mia` | Modo cotización, borrador editable, confirmación | `src/components/organism/mia-ai/QuoteDraftPanel.tsx`, `src/services/CotizacionIaService.ts`, `src/utils/quoteDraft.ts` |
-| `admin_mia` | Vista de cotizaciones (lista, detalle, archivos) | `app/dashboard/cotizaciones-ia/`, `angel/**` |
+| `mia_ai` | Agente, enriquecimiento con opciones, esquema Zod, lectores, subida de originales, `zip-guard` | `src/agents/quote/` (incluye `quote-options.enricher.ts`), `src/repositories/quote-storage.repository.ts`, `src/utils/zip-guard.ts` |
+| `bacl` | SQL + módulo (validación, repositorio, URL firmada, rate limit, archivo-pre-confirmación) | `sql/cotizaciones_ia.sql`, `api/modules/cotizacionesIa/`, `v2/router/mia.js` |
+| `mia` | Modo cotización, borrador editable, modal de opciones, archivos en el chat, confirmación | `src/components/organism/mia-ai/QuoteDraftPanel.tsx`, `src/components/molecule/mia-ai/QuoteItemCard.tsx`, `src/services/CotizacionIaService.ts`, `src/utils/quoteDraft.ts` |
+| `admin_mia` | Vista de cotizaciones (lista, detalle, archivos, opciones encontradas) | `app/dashboard/cotizaciones-ia/`, `angel/**` |
 
 - **Campos requeridos para confirmar**: vuelo (origen, destino, salida) · renta de auto (lugar y fechas de recogida/entrega) · hotel (ciudad u hotel, entrada, salida) · autobús (origen, destino, salida). Fechas ISO `YYYY-MM-DD`.
 - `mia_ai` **recorta** el borrador a los límites de validación de bacl (`cotizacionesIa.schema.js`) para no provocar 400 por longitud.
 
-### 0.3 PASOS MANUALES (lo que debe hacer una persona)
+### 0.3 PASOS MANUALES -- estado real (27-oct-2026)
 
-**Para que cotizaciones funcione (en este orden):**
-1. Correr `bacl/sql/cotizaciones_ia.sql` en la base MySQL de bacl. **En local, bacl apunta a producción**: revisar antes. Solo agrega (tablas nuevas + permiso), no modifica lo existente.
-2. Crear el bucket **privado** `cotizaciones-mia` en Supabase Storage (proyecto de MIA). Otro nombre → variable `COTIZACIONES_BUCKET` en `bacl` y `mia_ai`. Sin bucket, el borrador sale con `uploadError` y no se guarda el original.
-3. Otorgar el permiso `view.cotizaciones_ia` a PATY y Operaciones (bloque comentado al final del `.sql`). Es distinto del permiso viejo `view.cotizaciones` (correos procesados).
-4. Poner una llave de IA **con cuota**: la cuota gratuita de Gemini se agotó (429) y `OPENAI_API_KEY` sigue con el valor de ejemplo. Sin esto no hay pruebas con modelo real ni respaldo.
-5. `npm install` en cada entorno donde se despliegue `mia_ai` (nueva dependencia `exceljs`).
+**Para que cotizaciones funcione:**
+1. ✅ `bacl/sql/cotizaciones_ia.sql` corrido en MySQL (producción).
+2. ✅ Bucket privado creado en Supabase Storage -- **ojo: se llamó `archivos_mia`, no el default `cotizaciones-mia`**. `COTIZACIONES_BUCKET=archivos_mia` ya está puesto en `bacl/.env` y `mia_ai/.env` -- si se despliega a otro entorno, hay que ponerlo ahí también o el borrador sale con `uploadError`.
+3. ✅ Permiso `view.cotizaciones_ia` otorgado a `luis.castaneda@noktos.com`. Falta dárselo a PATY/Operaciones cuando se sepa su correo (bloque comentado al final del `.sql`).
+4. ⏳ **Sigue pendiente**: llave de IA con cuota real. Gemini gratis sigue en 429 (20 solicitudes/día, límite duro) y `OPENAI_API_KEY` no está puesta -- decisión explícita de seguir con la actual por ahora.
+5. ✅ `npm install` corrido (incluye `exceljs`).
 
-**Para validar:**
-6. Prueba de punta a punta: en mia activar "Solicitar cotización" → texto y archivo → editar → confirmar → abrir la cotización y su archivo en `/dashboard/cotizaciones-ia`.
-7. Revisión visual (los agentes no ven el navegador): modo cotización, borrador, móvil, "Reenviar de todos modos", "Nueva conversación".
-8. En desarrollo `usePermiso` da `true` a todos: comprobar el ocultamiento por permiso en un entorno con permisos reales.
+**Validado de punta a punta (27-oct-2026):** cotización de vuelo real por curl → 3 opciones reales (Aeroméxico, Volaris, Viva Aerobus) sin precio; carry-forward confirmado entre turnos; bus y auto probados (ADO/Estrella Roja, Hertz/Avis/Enterprise); hotel confirmado que nunca trae opciones. UI revisada en navegador por el usuario: modal de opciones, archivos en el chat, aviso de "sin opciones", cabina en español, sin mención de Gemini/OpenAI -- todo confirmado funcionando.
+
+**Pendiente de validar:**
+- En desarrollo `usePermiso` da `true` a todos: falta comprobar el ocultamiento por permiso en un entorno con permisos reales.
 
 **Hallazgos ajenos a cotizaciones (pendientes de arreglar):**
-9. Preguntar sobre un PDF/CSV ya subido falla: `text-embedding-004` responde 404 (actualizar `GEMINI_EMBEDDING_MODEL` o usar OpenAI) y a `mia_document_chunks` le faltan las columnas `file_name text`, `file_type text`, `chunk_index int`, `token_count int` (el código las inserta; hoy los vectores caen a memoria local).
+- Preguntar sobre un PDF/CSV ya subido falla: `text-embedding-004` responde 404 (actualizar `GEMINI_EMBEDDING_MODEL` o usar OpenAI) y a `mia_document_chunks` le faltan las columnas `file_name text`, `file_type text`, `chunk_index int`, `token_count int` (el código las inserta; hoy los vectores caen a memoria local).
 
 ### 0.4 Pendiente / siguientes pasos
 
-- **Seguridad del POST de cotizaciones**: la `x-api-key` viaja en el bundle del frontend, así que `id_usuario` es declarativo (ya se valida que `storage_path` empiece con la carpeta del propio usuario). Recomendado: validar la sesión de MIA en bacl, y registrar quién abre cada archivo. El rate limit (20 solicitudes/10 min por IP) es en memoria y **por instancia** (en Vercel no es exacto).
+- **Seguridad del POST de cotizaciones**: la `x-api-key` viaja en el bundle del frontend, así que `id_usuario` es declarativo (ya se valida que `storage_path` empiece con la carpeta del propio usuario, en los dos endpoints de archivo). Recomendado: validar la sesión de MIA en bacl, y registrar quién abre cada archivo. El rate limit (20 solicitudes/10 min por IP) es en memoria y **por instancia** (en Vercel no es exacto).
 - **Idempotencia**: un reintento tras perder la respuesta puede duplicar la cotización (el front avisa en vez de reintentar a ciegas).
-- **Hoteles en el chat con IA**: en espera. Hay una integración candidata (NEMU, repo aparte) por evaluar; mia ya tiene su propio catálogo de hoteles en la parte de reservas.
+- **Hoteles en el chat con IA**: se investigó la integración candidata (Nemo/NEMU, repo `care_nemu` aparte) el 27-oct. Conclusión: **no conectarla directo a los agentes todavía** -- es una plataforma de reservas completa (orgs, créditos, trips reales), no una simple API de hoteles, y mezclar su complejidad con el patrón liviano de los agentes de transporte (solo búsqueda web, sin inventario real) es un salto demasiado grande. Se probaron 2 endpoints de solo lectura de Nemo directamente (fuera de mia_ai, en `care_nemu/pruebas_api`): el catálogo de hoteles (`/hotels/catalog`) funciona -- se le encontró y corrigió un bug real (el parser esperaba un contrato XML distinto al que Nemo realmente regresa, nunca se había probado contra producción) -- pero la búsqueda de disponibilidad (`/hotels/search`) falla con `NullPointerException` del lado de Nemo, aparentemente porque la cuenta/contrato no tiene proveedores habilitados para ese flujo (el catálogo es un sistema independiente, según su propia documentación). Reportado a soporte de Price Navigator vía el jefe del usuario, pendiente de respuesta. mia ya tiene su propio catálogo de hoteles en la parte de reservas, de cualquier forma.
 - **Mejoras del agente de autobuses**: subir el historial que ven los agentes de transporte de 4 a 6 mensajes (`recentHistory.slice(-4)`); horarios reales solo con convenio/API de pago (Busbud/Reservamos), descartado por ahora.
-- **Revisar aparte**: la rama de `classifyIntent` que continúa el servicio activo con fecha/pasajeros afecta el enrutado de transporte; errores conocidos de `createCartItem`/`createSolicitudes` en bacl `/v1` (tipo desconocido → 500, `catch` que usa `res` fuera de alcance); `tsc` de `admin_mia` no revisa tipos por su `ignoreDeprecations`; `StayCalendar.tsx` (mia) tiene un error de sintaxis previo.
+- **Revisar aparte**: la rama de `classifyIntent` que continúa el servicio activo con fecha/pasajeros afecta el enrutado de transporte; errores conocidos de `createCartItem`/`createSolicitudes` en bacl `/v1` (tipo desconocido → 500, `catch` que usa `res` fuera de alcance) -- no tocado.
+- **Deuda técnica de tipos recién visible**: el `tsc --noEmit` plano de `admin_mia` y de `mia` no estaba revisando nada en realidad (ver nota abajo) -- al correrlo bien salieron ~254 errores preexistentes en `admin_mia` y errores en ~50 archivos de `mia`. Es deuda vieja, no de hoy; no se tocó, queda como proyecto aparte si se decide atacarla.
 - **Límites del lector de archivos**: sin OCR (PDF escaneado → subir como imagen); `.xls` antiguo no se lee (solo `.xlsx`); PDF limitado a 30 páginas; xlsx limitado a 20 MB descomprimido y 200 entradas.
+
+### 0.4.1 Dos bugs de "el typecheck no revisaba nada" (lección para el equipo)
+
+Encontrados y corregidos el 27-oct-2026, documentados aparte porque son del tipo que vuelve a pasar si no se sabe:
+
+1. **`admin_mia/tsconfig.json`** tenía `"ignoreDeprecations": "6.0"`, un valor inválido para la versión de TypeScript instalada (5.2.2). `tsc` abortaba en el parseo del config **antes de revisar un solo archivo**, sin avisar claramente. Ya se quitó la línea.
+2. **`mia/tsconfig.json`** (raíz) es un archivo "solución" (`"files": []` + `"references"`), pensado para `tsc -b`. Correr `npx tsc --noEmit` a secas en la raíz no revisa nada -- hay que usar `npx tsc --noEmit -p tsconfig.app.json`. Todo el "typecheck limpio" reportado durante la sesión de hoy antes de descubrir esto **no estaba verificando nada de verdad** -- al correr el comando correcto salieron 2 bugs reales de narrowing en `QuoteItemCard.tsx` (ya corregidos) y confirmó que `StayCalendar.tsx` (archivo huérfano, incompleto desde su único commit de mayo 2025, nunca importado en ningún lado) llevaba roto todo este tiempo -- se borró.
+
+**Para cualquiera que use `tsc` en estos repos:** en `admin_mia`, `npx tsc --noEmit` ya funciona bien. En `mia`, usar siempre `npx tsc --noEmit -p tsconfig.app.json`, nunca el comando a secas en la raíz.
 
 ### 0.5 Variables de entorno nuevas o relevantes
 
 | Variable | Uso |
 | :--- | :--- |
-| `COTIZACIONES_BUCKET` | Bucket privado de Storage (default `cotizaciones-mia`), en `mia_ai` y `bacl` |
+| `COTIZACIONES_BUCKET` | Bucket privado de Storage, en `mia_ai` y `bacl`. **En este proyecto vale `archivos_mia`**, no el default `cotizaciones-mia` del código -- ya puesto en ambos `.env` locales. |
 | `TAVILY_API_KEY` | Búsqueda web (opcional; sin ella cae a DuckDuckGo, que es frágil) |
 | `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | Si están vacías, sesiones y vectores viven en memoria y se pierden al reiniciar |
 
