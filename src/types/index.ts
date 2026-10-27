@@ -64,6 +64,12 @@ export interface TransportOptionItem {
   sourceUrl?: string;
 }
 
+// Opción encontrada por un agente de transporte y anexada a un ítem de cotización.
+// Mismo shape que TransportOptionItem, con un id propio para que el cliente marque su preferida.
+export interface QuoteFoundOption extends TransportOptionItem {
+  id: string;
+}
+
 export type UIPayloadType =
   | "none"
   | "transport_options"
@@ -117,6 +123,8 @@ export interface FlightQuoteItem extends QuoteItemBase {
   airline?: string;
   cabin?: string;
   flightNumber?: string;
+  foundOptions?: QuoteFoundOption[];
+  preferredOptionId?: string | null;
 }
 
 export interface CarRentalQuoteItem extends QuoteItemBase {
@@ -129,6 +137,8 @@ export interface CarRentalQuoteItem extends QuoteItemBase {
   dropoffTime?: string;
   carCategory?: string;
   withDriver?: boolean;
+  foundOptions?: QuoteFoundOption[];
+  preferredOptionId?: string | null;
 }
 
 export interface HotelQuoteItem extends QuoteItemBase {
@@ -150,6 +160,8 @@ export interface BusQuoteItem extends QuoteItemBase {
   returnDate?: string;
   busLine?: string;
   serviceClass?: string;
+  foundOptions?: QuoteFoundOption[];
+  preferredOptionId?: string | null;
 }
 
 export type QuoteItem =

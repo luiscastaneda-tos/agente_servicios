@@ -2,6 +2,18 @@ import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { v4 as uuidv4 } from "uuid";
 import { GuardrailsService } from "../../guardrails/guardrails.service";
 import { QuoteStorageRepository } from "../../repositories/quote-storage.repository";
+import {
+  FlightRepository,
+  CarRentalRepository,
+  BusRepository,
+} from "../../repositories/transport/transport.repositories";
+import { WebSearchRepository } from "../../repositories/web-search.repository";
+import {
+  BusAgent,
+  CarRentalAgent,
+  FlightAgent,
+} from "../transport/transport-specialist.agents";
+import { enrichWithFoundOptions } from "./quote-options.enricher";
 import { LLMStrategyContext, llmContext } from "../../strategies/llm.context";
 import {
   AgentExecutionResult,
@@ -10,6 +22,7 @@ import {
   QuoteDraft,
   QuoteFileRef,
   QuoteItem,
+  QuoteServiceType,
   SessionState,
   UIPayload,
 } from "../../types";
@@ -52,7 +65,16 @@ export class QuoteAgent {
   constructor(
     private readonly llm: LLMStrategyContext = llmContext,
     private readonly guardrails: GuardrailsService = new GuardrailsService(),
-    private readonly storage: QuoteStorageRepository = new QuoteStorageRepository()
+    private readonly storage: QuoteStorageRepository = new QuoteStorageRepository(),
+    private readonly flightAgent: FlightAgent = new FlightAgent(
+      new FlightRepository(new WebSearchRepository())
+    ),
+    private readonly carRentalAgent: CarRentalAgent = new CarRentalAgent(
+      new CarRentalRepository(new WebSearchRepository())
+    ),
+    private readonly busAgent: BusAgent = new BusAgent(
+      new BusRepository(new WebSearchRepository())
+    )
   ) {}
 
   public async execute(
@@ -121,6 +143,28 @@ export class QuoteAgent {
       items = items.slice(0, MAX_QUOTE_ITEMS);
       read.warnings.push(
         `Solo puedo incluir ${MAX_QUOTE_ITEMS} servicios por cotización; dejé los primeros ${MAX_QUOTE_ITEMS}.`
+      );
+    }
+
+    // 4b. Opciones encontradas (flight/car_rental/bus): el LLM de extracción no las conoce
+    //     ni las devuelve, así que se reponen a mano. Si los campos de búsqueda del ítem no
+    //     cambiaron respecto al turno anterior, se conserva lo que ya había (incluida la
+    //     preferida del cliente); si cambiaron o es nuevo, se buscan opciones frescas.
+    items = this.carryForwardFoundOptions(items, currentItems);
+    try {
+      items = await enrichWithFoundOptions(
+        items,
+        {
+          flightAgent: this.flightAgent,
+          carRentalAgent: this.carRentalAgent,
+          busAgent: this.busAgent,
+        },
+        session,
+        preferredProvider
+      );
+    } catch (err) {
+      console.warn(
+        `[quote_agent] No se pudieron buscar opciones: ${(err as Error).message}`
       );
     }
 
@@ -208,9 +252,10 @@ REGLAS ESTRICTAS:
 6. Si hay BORRADOR ACTUAL, devuelve la lista COMPLETA de ítems ya actualizada con lo nuevo que dijo el usuario: conserva el "id" de los ítems existentes, los ítems nuevos van sin "id", y quita solo lo que el usuario pida quitar. Si el mensaje no cambia nada, devuelve los mismos ítems.
 7. "answer": 1 o 2 frases en español que resuman lo que entendiste. NO hagas preguntas ni menciones precios (el sistema añade lo que falte).
 8. "resumen": una línea de máximo 140 caracteres que describa la solicitud. "notas": observaciones útiles para Operaciones que no encajen en los campos (preferencias, equipaje, restricciones), sin precios ni cifras de dinero.
+9. Todo texto libre en español, aunque el usuario lo haya escrito en inglés o mezclado: "cabin" usa "Económica"/"Premium Economy"/"Ejecutiva"/"Primera Clase" (nunca "economy"/"business"); "carCategory", "roomType", "serviceClass" igual, en español.
 
 CAMPOS POR TIPO (todos opcionales salvo "type"; "travelers" número de personas, "travelerNames" lista de nombres, "notes" texto):
-- flight: tripType ("oneway"|"roundtrip"|"multicity"), origin, destination, departureDate, returnDate, airline, cabin, flightNumber
+- flight: tripType ("oneway"|"roundtrip"|"multicity"), origin, destination, departureDate, returnDate, airline, cabin (en español: "Económica"/"Premium Economy"/"Ejecutiva"/"Primera Clase"), flightNumber
 - car_rental: pickupLocation, dropoffLocation, pickupDate, dropoffDate, pickupTime, dropoffTime, carCategory, withDriver (true/false)
 - hotel: city, hotelName, checkIn, checkOut, rooms, roomType, guests
 - bus: origin, destination, departureDate, returnDate, busLine, serviceClass
@@ -242,9 +287,17 @@ Responde ÚNICAMENTE con un objeto JSON válido:
     parts.push(`Mensaje del usuario: "${input.userMessage}"`);
 
     if (input.currentItems.length > 0 || input.currentNotes) {
+      // foundOptions/preferredOptionId son datos nuestros (opciones que ya buscamos) que el
+      // modelo nunca necesita ver ni devolver: quitarlos aquí evita que el modelo las altere
+      // al regenerar el ítem (rompería el carry-forward en código) y reduce tokens de prompt.
+      const itemsForPrompt = input.currentItems.map((item) => {
+        const { foundOptions, preferredOptionId, ...rest } =
+          item as unknown as Record<string, unknown>;
+        return rest;
+      });
       parts.push(
         `BORRADOR ACTUAL (JSON):\n${JSON.stringify({
-          items: input.currentItems,
+          items: itemsForPrompt,
           notas: input.currentNotes ?? "",
         })}`
       );
@@ -361,6 +414,42 @@ Responde ÚNICAMENTE con un objeto JSON válido:
     });
 
     return items;
+  }
+
+  // Repone foundOptions/preferredOptionId cuando los campos de búsqueda del ítem no cambiaron
+  // respecto al turno anterior (el LLM de extracción no conoce estos campos: nunca los
+  // devuelve, así que sin esto se perderían en cada mensaje nuevo).
+  private carryForwardFoundOptions(
+    items: QuoteItem[],
+    previous: QuoteItem[]
+  ): QuoteItem[] {
+    const prevById = new Map(previous.map((item) => [item.id, item]));
+    return items.map((item) => {
+      const prev = prevById.get(item.id);
+      if (!prev || prev.type !== item.type) return item;
+      if (!this.searchFieldsUnchanged(item, prev)) return item;
+      const prevRecord = prev as unknown as Record<string, unknown>;
+      if (prevRecord.foundOptions === undefined) return item;
+      return {
+        ...item,
+        foundOptions: prevRecord.foundOptions,
+        preferredOptionId: prevRecord.preferredOptionId ?? null,
+      } as QuoteItem;
+    });
+  }
+
+  private static readonly SEARCH_RELEVANT_FIELDS: Record<QuoteServiceType, string[]> = {
+    flight: ["origin", "destination", "departureDate"],
+    car_rental: ["pickupLocation", "pickupDate"],
+    hotel: [],
+    bus: ["origin", "destination", "departureDate"],
+  };
+
+  private searchFieldsUnchanged(a: QuoteItem, b: QuoteItem): boolean {
+    const keys = QuoteAgent.SEARCH_RELEVANT_FIELDS[a.type];
+    const ra = a as unknown as Record<string, unknown>;
+    const rb = b as unknown as Record<string, unknown>;
+    return keys.every((key) => ra[key] === rb[key]);
   }
 
   private fallbackSummary(items: QuoteItem[]): string {

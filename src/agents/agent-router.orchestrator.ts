@@ -146,7 +146,14 @@ export class AgentRouterOrchestrator {
       this.llm,
       this.guardrails
     );
-    this.quoteAgent = new QuoteAgent(this.llm, this.guardrails);
+    this.quoteAgent = new QuoteAgent(
+      this.llm,
+      this.guardrails,
+      undefined,
+      this.flightAgent,
+      this.carRentalAgent,
+      this.busAgent
+    );
     this.generalAgent = new GeneralMiaAgent(this.llm, this.guardrails);
   }
 

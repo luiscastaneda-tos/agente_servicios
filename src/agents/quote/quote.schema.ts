@@ -7,6 +7,18 @@ import {
 } from "../../types";
 import { parseTravelDate } from "../../utils/date-parser";
 import { stripPrices } from "../../utils/price-filter";
+import { TransportOptionSchema } from "../../guardrails/guardrails.service";
+
+// Opción encontrada por un agente de transporte (mismo shape que TransportOptionSchema)
+// más un id propio, generado por nosotros, para que el cliente marque su preferida.
+const QuoteFoundOptionSchema = z
+  .object({ id: z.string().max(64) })
+  .and(TransportOptionSchema);
+
+const withFoundOptions = {
+  foundOptions: z.array(QuoteFoundOptionSchema).max(3).optional(),
+  preferredOptionId: z.string().max(64).nullable().optional(),
+};
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const HOUR = /^([01]?\d|2[0-3]):[0-5]\d$/;
@@ -81,6 +93,7 @@ const FlightSchema = z.object({
   airline: textMax(80),
   cabin: textMax(40),
   flightNumber: textMax(20),
+  ...withFoundOptions,
 });
 
 const CarRentalSchema = z.object({
@@ -94,6 +107,7 @@ const CarRentalSchema = z.object({
   dropoffTime: hour,
   carCategory: textMax(80),
   withDriver: z.boolean().optional().catch(undefined),
+  ...withFoundOptions,
 });
 
 const HotelSchema = z.object({
@@ -117,6 +131,7 @@ const BusSchema = z.object({
   returnDate: isoDate,
   busLine: textMax(80),
   serviceClass: textMax(60),
+  ...withFoundOptions,
 });
 
 // z.object descarta las claves desconocidas, así que cualquier "precio"/"total" que
