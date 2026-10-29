@@ -4,7 +4,7 @@ Documento de entrega técnica y guía de operación del microservicio de Intelig
 
 ---
 
-## 0. Estado actual (actualizado 27-oct-2026)
+## 0. Estado actual (actualizado 29-oct-2026)
 
 > Esta sección es la fuente de verdad de **dónde nos quedamos**. Las secciones 1–4 son la documentación base del servicio y siguen vigentes salvo donde se indica.
 
@@ -41,7 +41,7 @@ mia (chat siempre en modo cotización)
     "Abrir" pide a bacl una URL firmada de 300 s del archivo original
 ```
 
-- **Opciones encontradas, solo flight/car_rental/bus** (nunca hotel -- mia ya tiene su propio catalogo de hoteles en otra parte, mezclar fue decision explicita de dejarlo fuera). Si el item es elegible (tiene origen/destino o lugar de recoleccion) pero no trae opciones, el borrador muestra "No se pudieron buscar opciones por ahora" en vez de quedarse mudo.
+- **Opciones encontradas: flight/car_rental/bus desde el 27-oct, hotel desde el 29-oct** (ver 0.2.1/0.2.2 -- la nota original decía "nunca hotel", ya no aplica). Si el item es elegible (tiene origen/destino o lugar de recoleccion) pero no trae opciones, el borrador muestra "No se pudieron buscar opciones por ahora" en vez de quedarse mudo.
 - **El LLM de extraccion no sabe nada de foundOptions/preferredOptionId** -- nunca los devuelve, por eso `quote.agent.ts` los repone a mano cada turno (`carryForwardFoundOptions`) y los quita del JSON que arma el prompt (`buildUserMessage`) para que el modelo no los altere al regenerar el item.
 - **Archivos ya subidos en el chat (antes de confirmar)**: se muestran debajo de los mensajes, con boton para abrirlos. Usan un endpoint nuevo de bacl (`GET /cotizaciones-ia/archivos/url`) distinto al de Operaciones, porque antes de confirmar el archivo vive solo en Storage, sin fila en `cotizaciones_ia_archivos` todavia.
 - **Por qué un camino separado**: el flujo antiguo (`POST /mia/solicitud` con `tradicional:false`) mete la solicitud al **carrito de pago** y exige `total`; Stripe suma esos totales. Una cotización sin precio no cabe ahí.
@@ -88,12 +88,44 @@ mia (chat siempre en modo cotización)
 - **Inventario de certificación limitado**: hoy solo hay disponibilidad confirmada en Mar del Plata (destino `5718`). La mayoría de ciudades mexicanas típicas devuelven 0 resultados por ahora — se degrada igual que "sin opciones" (mismo patrón fail-soft que flight/car_rental/bus), no es un bug.
 - Nueva variable de entorno: `HOTEL_SERVICE_URL` (default `http://localhost:3001`), en `env.ts` y `.env.example`. Si `pruebas_api` no está arriba, el `try/catch` dedicado hace que el ítem de hotel simplemente no traiga `foundOptions`; el resto del borrador no se ve afectado.
 - **Fuera de esta ronda (a propósito)**: no se tocó `bacl` ni `admin_mia`. Como `bacl` no declara `foundOptions`/`preferredOptionId` para hotel en su esquema Zod, hoy se descartan en silencio al confirmar (mismo comportamiento ya existente para cualquier campo no declarado). La opción se ve y se puede marcar en el chat de `mia`, pero todavía no viaja a Operaciones — pendiente de decisión del usuario.
+  - **Actualizado más tarde el mismo día**: ver 0.2.2 — esto sigue siendo cierto solo para `foundOptions`/`preferredOptionId` (las opciones de Nemo). El detalle de habitaciones (`rooms`) sí se conectó hasta `bacl`/`admin_mia`.
+
+### 0.2.2 Habitaciones por cuarto, selección por habitación y viajeros (29-oct-2026, tarde)
+
+Con el `HotelAgent` ya funcionando, se rediseñó cómo se captura un hotel en la cotización — de "cantidad de cuartos + un solo tipo + un total de huéspedes" a **un formulario real por habitación**, y esta vez sí se conectó hasta Operaciones:
+
+- **Nueva forma de `rooms`** (reemplaza por completo los campos planos `rooms: number` / `roomType: string` / `guests: number`):
+  ```ts
+  interface HotelRoomDetail {
+    roomType?: string;          // requerido por habitación
+    leadGuest?: string;         // "Titular" — requerido por habitación
+    additionalGuests?: string[]; // opcional
+  }
+  // HotelQuoteItem.rooms?: HotelRoomDetail[]
+  ```
+  Igual en los 4 repos: `agente_servicios` (`types/index.ts`, `quote.schema.ts` con `HotelRoomSchema`), `mia` (`miaAiService.ts`, `quoteDraft.ts`), `bacl` (`cotizacionesIa.schema.js`, con nueva regla en `validateCotizacion`: cada habitación necesita `roomType` y `leadGuest`), `admin_mia` (`cotizacionesIa/index.ts`, y `camposDeItem` en `angel/lib/cotizacionesIa.ts` ahora arma una fila "Habitación N" por cuarto). **Esta vez sí se tocó `bacl`/`admin_mia`** — a diferencia de `foundOptions`, el detalle de habitaciones es dato real que Operaciones necesita, no solo informativo.
+  - `computeMissingFields` (en `quote.schema.ts` y en `mia/quoteDraft.ts`, por separado — siguen siendo dos copias de las reglas de "requerido" que hay que mantener iguales) agrega una entrada sintética `{field: "rooms", label: "Habitaciones"}` si no hay ninguna habitación o si alguna le falta tipo/titular.
+  - El prompt del `QuoteAgent` (`buildSystemPrompt()`) se actualizó para describir la forma nueva y pedirle al LLM que, si el usuario pide un hotel sin detalle de habitaciones, igual agregue `"rooms": [{}]` (una habitación vacía) para que el sistema marque qué falta — mismo criterio ya usado para "agregar el ítem aunque no traiga datos" (ver más abajo).
+- **Selección de "opciones encontradas" ahora es por habitación, no por el hotel completo**: antes, elegir una variante de Nemo siempre llenaba el `roomType` de la habitación 1 (quedó mal en cuanto hubo 2+ cuartos). Ahora cada habitación tiene su propio botón "Elegir tipo" (solo aparece si hay `foundOptions`); la primera vez que se elige una variante de cualquier hotel, ese hotel queda fijo para todo el ítem (llena `hotelName`), y desde ahí el modal se enfoca solo en las variantes de ese hotel (con un link "Ver otros hoteles" para cambiarlo). Todo esto es solo en `mia` (`QuoteItemCard.tsx`) — no requirió cambios de `agente_servicios` ni de los otros repos.
+- **`QuoteItemCard.tsx` rediseñado**: los campos ya no son inputs siempre abiertos — ahora es un resumen compacto (chips de solo lectura con lo ya capturado) más un botón "Editar" que abre un modal con el formulario de siempre. El bloque de "Habitaciones" es un desplegable cerrado por defecto (mismo patrón de acordeón ya usado en `CardBooking.tsx`/`CardInvoice.tsx`/`CardPayment.tsx`), con un punto rojo en el encabezado si falta tipo/titular de algún cuarto, sin necesidad de abrirlo para notarlo.
+- **"Titular" ahora es un combobox**, no texto libre: se agregó un fetch único (en `useMiaAiStudio.ts`, al montar el estudio) a `fetchViajerosCompanies()` — función que **ya existía** en `mia/src/hooks/useFetch.ts` y que llama a `GET /v1/mia/agentes/viajeros-con-empresas?id_agente=...` de `bacl` (la misma que ya usan `ManualReservationPage.tsx`/`Configuration.tsx`/`Admin.tsx`). La lista se pasa por props hasta `QuoteItemCard` y llena el `<select>` de "Titular" por habitación — no se creó ningún endpoint nuevo, se reutilizó el que ya existía.
+- **Bug de deduplicación corregido**: el hotel de prueba de certificación de Nemo solo tiene UNA tarifa real cargada, así que pedir habitación individual o doble devolvía la misma habitación dos veces (confirmado en vivo, no es un bug de nuestro código). `HotelServiceRepository` ahora deduplica variantes idénticas por contenido (`roomType`+`boardDescription`) antes de armar `roomVariants`.
+- **Fix aparte, mismo día, en el prompt del `QuoteAgent`**: si el usuario pide un servicio nuevo sin dar ningún detalle (ej. "¿y de autobuses?"), antes el agente no agregaba nada al borrador ("no se ha proporcionado nueva información..." en bucle). Ahora la regla 1 del prompt le dice explícitamente que agregue el ítem igual (aunque quede casi vacío) para que el sistema marque los campos faltantes, en vez de ignorar la petición.
+
+**Repos aparte, mismo día, relacionados con hoteles (no tocan `agente_servicios` directamente, documentados aquí por completitud):**
+- `care_nemu/pruebas_api` (rama `feat/hoteles-validate-cancellation-details`): se corrigió la estructura real de Nemo para `validate`/`cancellation-fees`/`details` (confirmado contra el proyecto SoapUI oficial de PriceSurfer) — estaban mandando el `TripProductID` suelto en la raíz en vez de anidado en `Products>Hotels>Hotel`, y `details` identificaba el hotel con el `hotelCode` numérico en vez del `HotelDetailId` real. Los tres ya funcionan en vivo contra el ambiente de certificación.
+- `care_nemu/noktos-care-foundation` (misma rama): se agregó `hotelDetailId` end-to-end (tipo, cliente HTTP, `results-step.tsx`) para que el detalle de hotel funcione desde la UI de reservas.
+- `mia_repositorio/mia`, rama `main`: se agregó una pantalla de mantenimiento (`src/components/page/MaintenancePage.tsx`) que reemplaza temporalmente todas las rutas (comentadas, no borradas, en `App.tsx`) — **ya está en producción**, sin relación con el trabajo de cotizaciones/hoteles.
+
+**Ramas de hoy (todo local + pusheado, nada mergeado a las ramas base todavía salvo la de mantenimiento en `mia`):**
+- `mia_repositorio` (`mia`, `agente_servicios`, `bacl`, `admin_mia`): rama `feat/agente-hoteles`.
+- `care_nemu` (`pruebas_api`, `noktos-care-foundation`): rama `feat/hoteles-validate-cancellation-details`.
 
 ### 0.4 Pendiente / siguientes pasos
 
 - **Seguridad del POST de cotizaciones**: la `x-api-key` viaja en el bundle del frontend, así que `id_usuario` es declarativo (ya se valida que `storage_path` empiece con la carpeta del propio usuario, en los dos endpoints de archivo). Recomendado: validar la sesión de MIA en bacl, y registrar quién abre cada archivo. El rate limit (20 solicitudes/10 min por IP) es en memoria y **por instancia** (en Vercel no es exacto).
 - **Idempotencia**: un reintento tras perder la respuesta puede duplicar la cotización (el front avisa en vez de reintentar a ciegas).
-- **Hoteles en el chat con IA — actualizado 29-oct-2026**: la nota de 27-oct de abajo ya no aplica tal cual. `/hotels/search` de `pruebas_api` se arregló y hoy sí funciona contra Nemo en vivo (de solo lectura), así que se conectó un `HotelAgent` dedicado (ver 0.2.1) — a diferencia del resto de agentes de transporte, sin LLM, porque la fuente ya da JSON estructurado. Queda igual: `bacl`/`admin_mia` no se tocaron, y mia ya tiene su propio catálogo de hoteles en la parte de reservas aparte.
+- **Hoteles en el chat con IA — actualizado 29-oct-2026**: la nota de 27-oct de abajo ya no aplica tal cual. `/hotels/search` de `pruebas_api` se arregló y hoy sí funciona contra Nemo en vivo (de solo lectura), así que se conectó un `HotelAgent` dedicado (ver 0.2.1) — a diferencia del resto de agentes de transporte, sin LLM, porque la fuente ya da JSON estructurado. Más tarde el mismo día (ver 0.2.2) sí se tocaron `bacl`/`admin_mia`, pero solo para el detalle de habitaciones (`rooms`) — las opciones encontradas de Nemo (`foundOptions`) siguen sin llegar a Operaciones, a propósito.
   - Nota original (27-oct, contexto histórico): se investigó la integración candidata (Nemo/NEMU, repo `care_nemu` aparte). Conclusión de entonces: no conectarla directo a los agentes todavía -- es una plataforma de reservas completa (orgs, créditos, trips reales), no una simple API de hoteles. Se probaron 2 endpoints de solo lectura de Nemo directamente (fuera de mia_ai, en `care_nemu/pruebas_api`): el catálogo de hoteles (`/hotels/catalog`) funcionaba -- se le encontró y corrigió un bug real (el parser esperaba un contrato XML distinto al que Nemo realmente regresa) -- pero la búsqueda de disponibilidad (`/hotels/search`) fallaba con `NullPointerException` del lado de Nemo. Ese bug ya se corrigió (ver 0.2.1).
 - **Mejoras del agente de autobuses**: subir el historial que ven los agentes de transporte de 4 a 6 mensajes (`recentHistory.slice(-4)`); horarios reales solo con convenio/API de pago (Busbud/Reservamos), descartado por ahora.
 - **Revisar aparte**: la rama de `classifyIntent` que continúa el servicio activo con fecha/pasajeros afecta el enrutado de transporte; errores conocidos de `createCartItem`/`createSolicitudes` en bacl `/v1` (tipo desconocido → 500, `catch` que usa `res` fuera de alcance) -- no tocado.
