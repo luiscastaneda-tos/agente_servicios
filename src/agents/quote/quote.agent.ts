@@ -8,12 +8,14 @@ import {
   BusRepository,
 } from "../../repositories/transport/transport.repositories";
 import { WebSearchRepository } from "../../repositories/web-search.repository";
+import { HotelServiceRepository } from "../../repositories/hotel-service.repository";
+import { HotelAgent } from "../hotel/hotel.agent";
 import {
   BusAgent,
   CarRentalAgent,
   FlightAgent,
 } from "../transport/transport-specialist.agents";
-import { enrichWithFoundOptions } from "./quote-options.enricher";
+import { enrichHotelOptions, enrichWithFoundOptions } from "./quote-options.enricher";
 import { LLMStrategyContext, llmContext } from "../../strategies/llm.context";
 import {
   AgentExecutionResult,
@@ -74,6 +76,9 @@ export class QuoteAgent {
     ),
     private readonly busAgent: BusAgent = new BusAgent(
       new BusRepository(new WebSearchRepository())
+    ),
+    private readonly hotelAgent: HotelAgent = new HotelAgent(
+      new HotelServiceRepository()
     )
   ) {}
 
@@ -167,6 +172,15 @@ export class QuoteAgent {
         `[quote_agent] No se pudieron buscar opciones: ${(err as Error).message}`
       );
     }
+    // Try/catch independiente: una falla del servicio de hoteles nunca debe romper el
+    // enriquecimiento de vuelo/auto/bus, ni viceversa.
+    try {
+      items = await enrichHotelOptions(items, this.hotelAgent);
+    } catch (err) {
+      console.warn(
+        `[quote_agent] No se pudieron buscar opciones de hotel: ${(err as Error).message}`
+      );
+    }
 
     // 5. Archivos: los ya guardados en el borrador + los nuevos de este mensaje.
     const files_: QuoteFileRef[] = [
@@ -244,7 +258,7 @@ export class QuoteAgent {
 Servicios posibles ("type"): "flight" (vuelo), "car_rental" (renta de auto), "hotel" (hotel), "bus" (autobús). El contenido puede traer varios servicios: crea UN ítem por servicio (un vuelo redondo es 1 ítem con tripType "roundtrip" y returnDate; dos hoteles distintos son 2 ítems).
 
 REGLAS ESTRICTAS:
-1. Usa SOLO datos presentes en la entrada o inferibles sin ambigüedad. Si un dato no está, OMÍTELO: no inventes ni uses textos como "por definir". Lo que falte lo pregunta el sistema.
+1. Usa SOLO datos presentes en la entrada o inferibles sin ambigüedad. Si un dato no está, OMÍTELO: no inventes ni uses textos como "por definir". Lo que falte lo pregunta el sistema. Si el usuario pide o menciona un servicio nuevo (ej. "y de autobuses?", "también necesito un hotel") aunque no dé NINGÚN detalle, igual AGREGA un ítem nuevo de ese "type" (aunque quede con ese único campo): así el sistema le muestra qué falta llenar. No ignores la petición solo porque no trajo datos.
 2. PROHIBIDO PRECIOS: ignora y no copies tarifas, costos, totales, cotizaciones de proveedores ni montos ($, MXN, USD, pesos) aunque aparezcan en los archivos. Tampoco pases cifras de dinero a "notas" ni a "notes", ni escritas con letra ("mil quinientos pesos"). Operaciones pone los precios.
 3. Fechas en ISO YYYY-MM-DD. Hoy es ${todayIso()} (zona America/Mexico_City): resuelve fechas relativas ("mañana", "el viernes") contra hoy. Si falta el año y la fecha ya pasó este año, usa el siguiente. Horas en HH:mm de 24 h.
 4. Lugares tal como aparecen; expande abreviaturas obvias (CDMX -> Ciudad de México, MTY -> Monterrey).
@@ -252,12 +266,12 @@ REGLAS ESTRICTAS:
 6. Si hay BORRADOR ACTUAL, devuelve la lista COMPLETA de ítems ya actualizada con lo nuevo que dijo el usuario: conserva el "id" de los ítems existentes, los ítems nuevos van sin "id", y quita solo lo que el usuario pida quitar. Si el mensaje no cambia nada, devuelve los mismos ítems.
 7. "answer": 1 o 2 frases en español que resuman lo que entendiste. NO hagas preguntas ni menciones precios (el sistema añade lo que falte).
 8. "resumen": una línea de máximo 140 caracteres que describa la solicitud. "notas": observaciones útiles para Operaciones que no encajen en los campos (preferencias, equipaje, restricciones), sin precios ni cifras de dinero.
-9. Todo texto libre en español, aunque el usuario lo haya escrito en inglés o mezclado: "cabin" usa "Económica"/"Premium Economy"/"Ejecutiva"/"Primera Clase" (nunca "economy"/"business"); "carCategory", "roomType", "serviceClass" igual, en español.
+9. Todo texto libre en español, aunque el usuario lo haya escrito en inglés o mezclado: "cabin" usa "Económica"/"Premium Economy"/"Ejecutiva"/"Primera Clase" (nunca "economy"/"business"); "carCategory", "serviceClass" y el "roomType" de cada habitación dentro de "rooms" igual, en español.
 
 CAMPOS POR TIPO (todos opcionales salvo "type"; "travelers" número de personas, "travelerNames" lista de nombres, "notes" texto):
 - flight: tripType ("oneway"|"roundtrip"|"multicity"), origin, destination, departureDate, returnDate, airline, cabin (en español: "Económica"/"Premium Economy"/"Ejecutiva"/"Primera Clase"), flightNumber
 - car_rental: pickupLocation, dropoffLocation, pickupDate, dropoffDate, pickupTime, dropoffTime, carCategory, withDriver (true/false)
-- hotel: city, hotelName, checkIn, checkOut, rooms, roomType, guests
+- hotel: city, hotelName, checkIn, checkOut, rooms (arreglo de habitaciones; cada una es un objeto con "roomType" en español y "leadGuest" el nombre del huésped principal de esa habitación; "additionalGuests" es una lista opcional de nombres extra en esa misma habitación). Si el usuario pide un hotel sin dar detalle de habitaciones, igual agrega "rooms": [{}] (una habitación vacía) para que el sistema pida los datos — mismo criterio que la regla 1.
 - bus: origin, destination, departureDate, returnDate, busLine, serviceClass
 
 Responde ÚNICAMENTE con un objeto JSON válido:
@@ -441,7 +455,7 @@ Responde ÚNICAMENTE con un objeto JSON válido:
   private static readonly SEARCH_RELEVANT_FIELDS: Record<QuoteServiceType, string[]> = {
     flight: ["origin", "destination", "departureDate"],
     car_rental: ["pickupLocation", "pickupDate"],
-    hotel: [],
+    hotel: ["city", "checkIn", "checkOut"],
     bus: ["origin", "destination", "departureDate"],
   };
 

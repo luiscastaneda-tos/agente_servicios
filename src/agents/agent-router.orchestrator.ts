@@ -18,6 +18,7 @@ import {
   TrainRepository,
 } from "../repositories/transport/transport.repositories";
 import { WebSearchRepository } from "../repositories/web-search.repository";
+import { HotelServiceRepository } from "../repositories/hotel-service.repository";
 import { LLMStrategyContext, llmContext } from "../strategies/llm.context";
 import {
   AgentExecutionResult,
@@ -29,6 +30,7 @@ import {
 } from "../types";
 import { parseTravelDate } from "../utils/date-parser";
 import { CsvAnalystAgent } from "./documents/csv-analyst.agent";
+import { HotelAgent } from "./hotel/hotel.agent";
 import { QuoteAgent } from "./quote/quote.agent";
 import { QuoteInputFile } from "./quote/quote-input.reader";
 import { QuoteDraftInput } from "./quote/quote.schema";
@@ -94,6 +96,7 @@ export class AgentRouterOrchestrator {
   private readonly ferryAgent: FerryAgent;
   private readonly trainAgent: TrainAgent;
   private readonly busAgent: BusAgent;
+  private readonly hotelAgent: HotelAgent;
   private readonly pdfAgent: PdfSpecialistAgent;
   private readonly csvAgent: CsvAnalystAgent;
   private readonly quoteAgent: QuoteAgent;
@@ -136,6 +139,7 @@ export class AgentRouterOrchestrator {
       this.llm,
       this.guardrails
     );
+    this.hotelAgent = new HotelAgent(new HotelServiceRepository());
     this.pdfAgent = new PdfSpecialistAgent(
       this.vectorStoreRepo,
       this.llm,
@@ -152,7 +156,8 @@ export class AgentRouterOrchestrator {
       undefined,
       this.flightAgent,
       this.carRentalAgent,
-      this.busAgent
+      this.busAgent,
+      this.hotelAgent
     );
     this.generalAgent = new GeneralMiaAgent(this.llm, this.guardrails);
   }

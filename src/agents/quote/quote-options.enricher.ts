@@ -1,3 +1,4 @@
+import { HotelAgent } from "../hotel/hotel.agent";
 import {
   BusAgent,
   CarRentalAgent,
@@ -7,6 +8,8 @@ import {
   BusQuoteItem,
   CarRentalQuoteItem,
   FlightQuoteItem,
+  HotelFoundOption,
+  HotelQuoteItem,
   LLMProviderType,
   QuoteFoundOption,
   QuoteItem,
@@ -137,6 +140,48 @@ export async function enrichWithFoundOptions(
       .slice(0, MAX_OPTIONS_PER_ITEM)
       .map((opt, i) => ({ ...opt, id: `${item.id}-opt-${i + 1}` }));
     foundById.set(item.id, options);
+  });
+
+  if (foundById.size === 0) return items;
+
+  return items.map((item) => {
+    const foundOptions = foundById.get(item.id);
+    if (!foundOptions) return item;
+    return { ...item, foundOptions, preferredOptionId: null } as QuoteItem;
+  });
+}
+
+function isHotelType(item: QuoteItem): item is HotelQuoteItem {
+  return item.type === "hotel";
+}
+
+// Ítems de hotel que todavía no tienen foundOptions y traen suficiente info para buscar.
+function isHotelEligible(item: QuoteItem): item is HotelQuoteItem {
+  if (!isHotelType(item)) return false;
+  if (item.foundOptions !== undefined) return false;
+  return Boolean(item.city && item.checkIn && item.checkOut);
+}
+
+// Busca opciones reales de hotel (sin precio) para los ítems que todavía no las tengan,
+// usando el HotelAgent (llamada directa al microservicio interno, sin LLM). No se mezcla
+// con enrichWithFoundOptions porque esa función es específica de flight/car_rental/bus.
+// Nunca lanza: si algo falla, el ítem simplemente se queda sin foundOptions.
+export async function enrichHotelOptions(
+  items: QuoteItem[],
+  hotelAgent: HotelAgent
+): Promise<QuoteItem[]> {
+  const eligible = items.filter(isHotelEligible);
+  if (eligible.length === 0) return items;
+
+  const settled = await Promise.allSettled(
+    eligible.map((item) => withTimeout(hotelAgent.search(item), SEARCH_TIMEOUT_MS))
+  );
+
+  const foundById = new Map<string, HotelFoundOption[]>();
+  eligible.forEach((item, idx) => {
+    const result = settled[idx];
+    if (result.status !== "fulfilled" || result.value.length === 0) return;
+    foundById.set(item.id, result.value.slice(0, MAX_OPTIONS_PER_ITEM));
   });
 
   if (foundById.size === 0) return items;

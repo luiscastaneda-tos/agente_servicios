@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  HotelQuoteItem,
   QuoteDraft,
   QuoteItem,
   QuoteMissingField,
@@ -110,6 +111,33 @@ const CarRentalSchema = z.object({
   ...withFoundOptions,
 });
 
+// Opción de hotel encontrada por el microservicio interno de búsqueda (no reutiliza
+// TransportOptionSchema: sus campos de transporte no aplican a hotel).
+const HotelFoundOptionSchema = z.object({
+  id: z.string().max(64),
+  hotelName: textMax(160),
+  city: textMax(120),
+  address: textMax(200),
+  rating: z.number().optional(),
+  roomVariants: z
+    .array(
+      z.object({
+        roomType: textMax(80),
+        boardDescription: textMax(120),
+      })
+    )
+    .max(3)
+    .optional(),
+  cancellationNote: textMax(80),
+  thumbnailUrl: textMax(500),
+});
+
+const HotelRoomSchema = z.object({
+  roomType: textMax(80),
+  leadGuest: textMax(120),
+  additionalGuests: z.array(z.string().trim().max(120)).max(20).optional(),
+});
+
 const HotelSchema = z.object({
   ...base,
   type: z.literal("hotel"),
@@ -117,9 +145,9 @@ const HotelSchema = z.object({
   hotelName: textMax(160),
   checkIn: isoDate,
   checkOut: isoDate,
-  rooms: countMax(50),
-  roomType: textMax(80),
-  guests: countMax(200),
+  rooms: z.array(HotelRoomSchema).max(50).optional(),
+  foundOptions: z.array(HotelFoundOptionSchema).max(3).optional(),
+  preferredOptionId: z.string().max(64).nullable().optional(),
 });
 
 const BusSchema = z.object({
@@ -199,6 +227,18 @@ export function computeMissingFields(items: QuoteItem[]): QuoteMissingField[] {
         missing.push({ itemId: item.id, field: rule.field, label: rule.label });
       }
     }
+    // "Requerido" para hotel incluye: al menos 1 habitación, y cada habitación
+    // con roomType y leadGuest llenos. REQUIRED_FIELDS no puede expresar esto
+    // (es por-escalar, no por-elemento de un arreglo), así que se verifica aparte.
+    if (item.type === "hotel") {
+      const rooms = (item as HotelQuoteItem).rooms ?? [];
+      const incomplete =
+        rooms.length === 0 ||
+        rooms.some((r) => !hasValue(r.roomType) || !hasValue(r.leadGuest));
+      if (incomplete) {
+        missing.push({ itemId: item.id, field: "rooms", label: "Habitaciones" });
+      }
+    }
   }
   return missing;
 }
@@ -236,6 +276,16 @@ export function compactItem<T extends QuoteItem>(item: T): T {
     if (value === undefined || value === null) continue;
     if (typeof value === "string" && value.trim() === "") continue;
     if (Array.isArray(value) && value.length === 0) continue;
+    // El loop genérico de arriba no mira dentro de los objetos de un arreglo:
+    // sin este filtro, una habitación vacía ({}) sobreviviría dentro de `rooms`.
+    if (key === "rooms" && Array.isArray(value)) {
+      const rooms = (value as Array<Record<string, unknown>>).filter(
+        (r) => hasValue(r?.roomType) || hasValue(r?.leadGuest)
+      );
+      if (rooms.length === 0) continue;
+      clean[key] = rooms;
+      continue;
+    }
     clean[key] = value;
   }
   return clean as unknown as T;

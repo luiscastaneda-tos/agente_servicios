@@ -70,6 +70,20 @@ export interface QuoteFoundOption extends TransportOptionItem {
   id: string;
 }
 
+// Opción de hotel encontrada vía el microservicio interno de búsqueda (no reutiliza
+// TransportOptionItem: sus campos de transporte no aplican a hotel). Nunca incluye
+// amount/currency/tripProductId ni nada que identifique al proveedor interno.
+export interface HotelFoundOption {
+  id: string;
+  hotelName: string;
+  city?: string;
+  address?: string;
+  rating?: number;
+  roomVariants?: { roomType: string; boardDescription: string }[];
+  cancellationNote?: string;
+  thumbnailUrl?: string;
+}
+
 export type UIPayloadType =
   | "none"
   | "transport_options"
@@ -141,15 +155,21 @@ export interface CarRentalQuoteItem extends QuoteItemBase {
   preferredOptionId?: string | null;
 }
 
+export interface HotelRoomDetail {
+  roomType?: string; // requerido en la práctica (se exige vía missing-fields, no via Zod .min)
+  leadGuest?: string; // requerido — huésped principal de ese cuarto
+  additionalGuests?: string[]; // opcional, nombres extra en ese mismo cuarto
+}
+
 export interface HotelQuoteItem extends QuoteItemBase {
   type: "hotel";
   city?: string;
   hotelName?: string;
   checkIn?: string;
   checkOut?: string;
-  rooms?: number;
-  roomType?: string;
-  guests?: number;
+  rooms?: HotelRoomDetail[];
+  foundOptions?: HotelFoundOption[];
+  preferredOptionId?: string | null;
 }
 
 export interface BusQuoteItem extends QuoteItemBase {

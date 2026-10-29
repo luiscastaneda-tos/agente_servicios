@@ -23,4 +23,5 @@ export const env = {
   slidingWindowMessages: Number(process.env.SLIDING_WINDOW_MESSAGES || 6),
   chunkSizeTokens: Number(process.env.CHUNK_SIZE_TOKENS || 500),
   chunkOverlapTokens: Number(process.env.CHUNK_OVERLAP_TOKENS || 50),
+  hotelServiceUrl: process.env.HOTEL_SERVICE_URL || "http://localhost:3001",
 };
